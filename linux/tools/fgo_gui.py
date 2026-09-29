@@ -312,6 +312,314 @@ def load_card_catalog():
     return catalog
 
 
+# --- Draw Rates (Server/artemis's own local summon-weight lottery) ---------
+# Not a retail probability table - a local simulation knob ARTEMiS itself
+# reads (Server/artemis/titles/fgo/summon_weights.py). One flat weighted
+# pool across every eligible Servant/CE (base print only, no story-only or
+# holo/alt-art entries) - not per-rarity buckets.
+MAX_SUMMON_WEIGHT = 1_000_000
+
+
+def summon_candidates_path():
+    return install_root() / "Server" / "artemis" / "titles" / "fgo" / "data" / "summon_candidates.json"
+
+
+def summon_weights_path():
+    return install_root() / "Server" / "artemis" / "config" / "fgo_summon_weights.json"
+
+
+def load_summon_candidates():
+    """The eligible summon pool - every non-"story"-category entry in
+    summon_candidates.json (confirmed to match the real weights file's own
+    entry count exactly: 1328 on this install). Returns card dicts in the
+    same shape used everywhere else in this file (tc_id/card_type_id/
+    servant_id/craft_essence_id/file_name/display_name), plus "rarity"."""
+    try:
+        document = json.loads(summon_candidates_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return []
+    candidates = []
+    for row in document.get("cards", []):
+        if not isinstance(row, dict) or row.get("category") == "story":
+            continue
+        try:
+            tc_id = int(row["tc_id"])
+            card_type_id = int(row["type"])
+            entity_id = int(row["entity_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        candidates.append({
+            "tc_id": tc_id,
+            "count": 0,
+            "card_type_id": card_type_id,
+            "servant_id": entity_id if card_type_id == 1 else 0,
+            "craft_essence_id": entity_id if card_type_id == 2 else 0,
+            "display_name": str(row.get("name", f"Trading Card {tc_id}")),
+            "file_name": str(row.get("file_name", "")),
+            "rarity": int(row.get("rarity", 0)),
+        })
+    return candidates
+
+
+def load_summon_weights(eligible_ids):
+    """Mirrors summon_weights.py's own read_weights() defaulting rules
+    exactly: an absent file means uniform weight 1 across the whole roster;
+    once a file exists, any eligible id it doesn't mention is weight 0 (not
+    1) - so a catalog update can only ever narrow an explicit configuration,
+    never silently re-include something the file's own author left out.
+    Falls back to the uniform default on a malformed file instead of
+    raising - this is an editor, not the runtime lottery itself."""
+    try:
+        document = json.loads(summon_weights_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {tc_id: 1 for tc_id in eligible_ids}
+    if not isinstance(document, dict) or document.get("version") != 1 or not isinstance(document.get("weights"), dict):
+        return {tc_id: 1 for tc_id in eligible_ids}
+    raw = document["weights"]
+    weights = {}
+    for tc_id in eligible_ids:
+        try:
+            weights[tc_id] = max(0, min(MAX_SUMMON_WEIGHT, int(raw.get(str(tc_id), 0))))
+        except (TypeError, ValueError):
+            weights[tc_id] = 0
+    return weights
+
+
+def save_summon_weights(weights):
+    """Always writes every eligible id explicitly (never omits one at its
+    default), so this file is never ambiguous about what it means - matches
+    summon_weights.py's own "omitted id means zero" rule by simply never
+    omitting anything ourselves."""
+    if sum(weights.values()) <= 0:
+        raise ValueError("At least one summon weight must be positive.")
+    payload = {"version": 1, "weights": {str(tc_id): int(w) for tc_id, w in sorted(weights.items())}}
+    path = summon_weights_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+# --- Audio volume (App/audio-volume.ini - scooby's AudioSettingsView) -----
+# Applied live by the game itself while running - not something
+# fgo-launcher.sh needs to inject at launch (confirmed: it has no
+# volume-related code at all).
+AUDIO_VOLUME_KEYS = ("bgm", "voice", "effects")
+
+
+def audio_volume_path():
+    return install_root() / "App" / "audio-volume.ini"
+
+
+def load_audio_volume():
+    path = audio_volume_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    values = {}
+    for key in AUDIO_VOLUME_KEYS:
+        try:
+            values[key] = max(0, min(100, int(get_ini_value(text, "audio", key, "100"))))
+        except (TypeError, ValueError):
+            values[key] = 100
+    return values
+
+
+def save_audio_volume(values):
+    path = audio_volume_path()
+    lines = ["[audio]"] + [f"{key}={max(0, min(100, int(values[key])))}" for key in AUDIO_VOLUME_KEYS]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# --- Event visibility ("Banners" in scooby - an LTE story-event filter, not
+# gacha pool/rate editing, which is the Draw Rates tab above) -------------
+# Two independent pieces: a one-time source patch to two ARTEMiS Python
+# files (adds the enabled_singularity_ids property/filter at all - without
+# it, the filter list below does nothing), and the filter list itself,
+# text-spliced into Server/artemis/config/fgo.yaml's own server: block.
+EVENT_TOGGLE_MARKER = "fgo_event_toggles_v1"
+
+EVENT_TOGGLE_IDS = [
+    ("8008", "Gudaguda Honnoji Temple"), ("8010", "The Garden of Order - Revival"),
+    ("8011", "600,000 Master Celebration"), ("8012", "Prisma Codes"),
+    ("8013", "Material Exchange Ticket Celebration"), ("8014", "2nd Anniversary"),
+    ("8015", "Da Vinci Acquisition Campaign - Revival II"),
+    ("8016", "Chaldea Battle Summer League - Revival"), ("8017", "Summer Warrior Vacation Training"),
+    ("8018", "Suzuka Gozen's Happy Merry Love Christmas!"),
+    ("8019", "Elena's Christmas Present Recapture Operation - Revival"), ("8020", "Setanta's Trials"),
+    ("8021", "Prisma Codes - Revival"), ("8022", "Lady Reines' Case Files"),
+    ("8023", "Summer Warrior Vacation Training - Revival"),
+    ("8025", "Servant Boot Camp! Mysterious Strict Instructor"),
+    ("8027", "Lady Reines' Case Files - Revival"),
+    ("8028", "Suzuka Gozen's Happy Merry Love Christmas! - Revival"),
+    ("8029", "Santa Fran's Christmas Present!"), ("8030", "Setanta's Trials - Revival"),
+    ("8031", "Invitation from BB"), ("8032", "Challenge to the Heights of Conquest!"),
+    ("8033", "Dream Journey ~A Dreamland of Mystery and Terror~"),
+    ("8034", "Servant Boot Camp! Mysterious Strict Instructor - Revival"),
+    ("8035", "Chaldea Summer Garden! The Visitor from the Other Side"),
+    ("8036", "Demon Beast Calamity Time Trial"),
+    ("8038", "Freezing Order! Goddess of Ice and Snow Descending on a Moonlit Night"),
+    ("8039", "Demon Beast Calamity Time Trial II"), ("8040", "Invitation from BB - Revival"),
+    ("8041", "Lovely Duty! End of Year Struggles of the Maid of Love"),
+    ("8042", "Santa Fran's Christmas Present! - Revival"),
+    ("8043", "NFF Premium Tour Invitation! Heroic Spirit Traveling Tour"),
+    ("8044", "Suzuka Gozen's Happy Merry Love Christmas! - Revival II"),
+    ("8045", "Destiny-Dividing: The Red Beast and the Flame's Mission"),
+    ("8046", "Demon Beast Calamity Time Trial V"), ("8047", "Setanta's Trials - Revival II"),
+    ("8048", "Chaldea Battle Summer League - Revival II"),
+    ("8049", "Santa Fran's Christmas Present! - Revival II"),
+]
+
+# (file, anchor_old, anchor_new) - byte-identical to scooby's own embedded
+# FGOLocalPlatform.EventTogglePatch.json, confirmed (2026-09-29) to match
+# this exact install's Server/artemis/titles/fgo/{config,index}.py verbatim.
+EVENT_TOGGLE_PATCH = [
+    ("config.py",
+     "    @property\n    def loglevel(self) -> int:",
+     "    @property\n    def enabled_singularity_ids(self) -> list | None:\n"
+     "        # None (key absent) means no filter. A list, including an empty list,\n"
+     "        # enables an allowlist for the event catalog and its derived banners.\n"
+     "        value = CoreConfig.get_config_field(\n"
+     "            self.__config, \"fgo\", \"server\", \"enabled_singularity_ids\", default=None\n"
+     "        )\n"
+     "        return value if isinstance(value, list) else None\n\n"
+     "    @property\n    def loglevel(self) -> int:"),
+    ("index.py",
+     "        result = []\n        for priority, catalog_row in enumerate(\n            sorted(\n                (\n"
+     "                    row\n                    for row in self._story_tlf_catalog()\n"
+     "                    if int(row[\"tlf_scenario_id\"])\n                    not in extra_interlude_scenario_ids\n"
+     "                ),\n                key=lambda row: int(row[\"tlf_scenario_id\"]),\n            ),\n"
+     "            start=1,\n        ):\n            tlf_scenario_id = int(catalog_row[\"tlf_scenario_id\"])",
+     "        # fgo_event_toggles_v1: None preserves original behavior exactly.\n"
+     "        enabled_singularity_ids = self.game_cfg.server.enabled_singularity_ids\n"
+     "        catalog_rows = list(self._story_tlf_catalog())\n        result = []\n"
+     "        for priority, catalog_row in enumerate(\n            sorted(\n                (\n"
+     "                    row\n                    for row in catalog_rows\n"
+     "                    if int(row[\"tlf_scenario_id\"])\n                    not in extra_interlude_scenario_ids\n"
+     "                    and (\n                        enabled_singularity_ids is None\n"
+     "                        or int(row[\"singularity_id\"]) in enabled_singularity_ids\n                    )\n"
+     "                ),\n                key=lambda row: int(row[\"tlf_scenario_id\"]),\n            ),\n"
+     "            start=1,\n        ):\n            tlf_scenario_id = int(catalog_row[\"tlf_scenario_id\"])"),
+]
+
+
+def fgo_yaml_path():
+    return install_root() / "Server" / "artemis" / "config" / "fgo.yaml"
+
+
+def event_toggle_target(file_name):
+    return install_root() / "Server" / "artemis" / "titles" / "fgo" / file_name
+
+
+def event_toggle_status():
+    """Whether the one-time source patch is already applied, per file."""
+    status = {}
+    for file_name, _, anchor_new in EVENT_TOGGLE_PATCH:
+        path = event_toggle_target(file_name)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            status[file_name] = None  # file not found at all
+            continue
+        status[file_name] = (anchor_new in text) or (EVENT_TOGGLE_MARKER in text)
+    return status
+
+
+def apply_event_toggle_patch():
+    """Applies EVENT_TOGGLE_PATCH to config.py/index.py, exactly matching
+    scooby's own ApplyEventTogglePatch(): every edit is checked before any
+    file is written (so a mismatch can't leave one file patched and not the
+    other), each write keeps a .event-toggle.bak, and py_compile validates
+    the result - restoring from that backup on a syntax error. Returns a
+    list of human-readable result lines."""
+    pending = []
+    messages = []
+    for file_name, anchor_old, anchor_new in EVENT_TOGGLE_PATCH:
+        target = event_toggle_target(file_name)
+        if not target.is_file():
+            raise RuntimeError(f"{target} was not found. The server files may have been updated "
+                                "since this was written.")
+        text = target.read_text(encoding="utf-8")
+        already_applied = (
+            anchor_new in text or EVENT_TOGGLE_MARKER in text
+            or (file_name == "config.py" and "def enabled_singularity_ids" in text)
+        )
+        if already_applied:
+            messages.append(f"{target.name} already has the patch applied.")
+            continue
+        if text.count(anchor_old) != 1:
+            raise RuntimeError(f"{target} does not match what this patch expects. The server files "
+                                "may have been updated since this was written.")
+        pending.append((target, text.replace(anchor_old, anchor_new, 1)))
+
+    for target, updated_text in pending:
+        backup = target.with_name(target.name + ".event-toggle.bak")
+        shutil.copy2(target, backup)
+        target.write_text(updated_text, encoding="utf-8")
+        result = subprocess.run([fgo_python(), "-m", "py_compile", str(target)], capture_output=True, text=True)
+        if result.returncode != 0:
+            shutil.copy2(backup, target)
+            raise RuntimeError(f"{target.name} failed validation and was restored from backup: "
+                                f"{result.stderr.strip()}")
+        messages.append(f"Applied to {target.name}")
+    return messages or ["No event-toggle changes were needed."]
+
+
+def load_enabled_singularity_ids():
+    try:
+        text = fgo_yaml_path().read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    match = re.search(r"^[ \t]*enabled_singularity_ids:[ \t]*\[([^\]]*)\]", text, re.MULTILINE)
+    if not match:
+        return set()
+    return {m for m in re.findall(r"[0-9]+", match.group(1))}
+
+
+def save_enabled_singularity_ids(ids):
+    """Text-splices just the enabled_singularity_ids: key into fgo.yaml's
+    own server: block, preserving every other line and the file's line
+    ending style - mirrors scooby's own WriteEnabledSingularityIds() (never
+    a full YAML round-trip, so nothing else in the file can be reformatted
+    or reordered by accident)."""
+    path = fgo_yaml_path()
+    original = path.read_text(encoding="utf-8")
+    line_ending = "\r\n" if "\r\n" in original else "\n"
+    trailing_newline = original.endswith("\n")
+    lines = original.replace("\r\n", "\n").split("\n")
+    if trailing_newline:
+        lines.pop()
+
+    server_start = next((i for i, line in enumerate(lines) if line.rstrip() == "server:"), None)
+    if server_start is None:
+        raise RuntimeError("fgo.yaml has no server: block. The file may have been edited by hand.")
+
+    insert_at = server_start + 1
+    replace_from = replace_to = -1
+    key_indent = 0
+    for i in range(server_start + 1, len(lines)):
+        trimmed = lines[i].lstrip()
+        if not trimmed or trimmed.startswith("#"):
+            continue
+        indent = len(lines[i]) - len(trimmed)
+        if indent == 0:
+            break
+        if replace_to == i and (indent > key_indent or (indent == key_indent and trimmed.startswith("- "))):
+            replace_to = i + 1
+        elif trimmed.startswith("enabled_singularity_ids:"):
+            key_indent = indent
+            replace_from = i
+            replace_to = i + 1
+        insert_at = i + 1
+
+    if replace_from < 0:
+        replace_from = replace_to = insert_at
+
+    value_text = "null" if not ids else "[" + ", ".join(sorted(ids, key=int)) + "]"
+    lines[replace_from:replace_to] = [f"  enabled_singularity_ids: {value_text}"]
+    new_text = line_ending.join(lines) + (line_ending if trailing_newline else "")
+    path.write_text(new_text, encoding="utf-8")
+
+
 def _patch_fgo_account_windows_only_check():
     """fgo_account.py's own purge_player_prints() (run on every account
     delete) checks a Windows-only NTFS reparse-point attribute
@@ -417,6 +725,17 @@ class CardTranslations:
 TRANSLATIONS = CardTranslations()
 
 
+def _make_modal(dialog, parent):
+    """transient() + grab_set(), safe against Tk's "grab failed: window not
+    viewable" - grab_set() requires the window to already be mapped on
+    screen, which isn't guaranteed right after Toplevel() on every window
+    manager/timing (a double-click-triggered dialog can win the race against
+    the first Map/Configure event). wait_visibility() blocks until it is."""
+    dialog.transient(parent)
+    dialog.wait_visibility()
+    dialog.grab_set()
+
+
 class CaptureDialog(tk.Toplevel):
     """Modal 'press a button' dialog for XInput live capture via evdev."""
 
@@ -430,8 +749,7 @@ class CaptureDialog(tk.Toplevel):
                   justify="center").pack(expand=True, fill="both", padx=16, pady=16)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda e: self.destroy())
-        self.transient(parent)
-        self.grab_set()
+        _make_modal(self, parent)
         self.after(50, self._poll)
 
     def _devices(self):
@@ -516,6 +834,15 @@ class SetupTab(ttk.Frame):
         ttk.Entry(self, textvariable=self.package_root_var, width=50).grid(row=row, column=0, columnspan=2, sticky="we")
         ttk.Button(self, text="Browse...", command=lambda: self._browse_dir(self.package_root_var)).grid(row=row, column=2, sticky="w", padx=(6, 0))
         row += 1
+        patch_buttons = ttk.Frame(self)
+        patch_buttons.grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(patch_buttons, text="Apply EN Patch", command=self._apply_en_patch).pack(side="left")
+        ttk.Button(patch_buttons, text="Revert EN Patch", command=self._revert_en_patch).pack(side="left", padx=(8, 0))
+        row += 1
+        self.patch_status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.patch_status_var, foreground="gray", wraplength=460).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        row += 1
 
         ttk.Separator(self, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
         row += 1
@@ -552,6 +879,34 @@ class SetupTab(ttk.Frame):
     def _resolved_wine(self):
         display = self.wine_display_var.get()
         return self._wine_by_label.get(display, display)
+
+    def _run_en_patch_script(self, extra_args, busy_text):
+        script = Path(__file__).resolve().parent.parent / "apply-en-patch.sh"
+        install_root_value = self.install_root_var.get().strip()
+        if not install_root_value:
+            self.patch_status_var.set("Set an install root above first.")
+            return
+        args = [str(script), "--install-root", install_root_value, "--non-interactive", *extra_args]
+        if self.package_root_var.get().strip():
+            args += ["--package-root", self.package_root_var.get().strip()]
+        self.patch_status_var.set(busy_text)
+        self.update_idletasks()
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=120)
+            tail = "\n".join((result.stdout + result.stderr).strip().splitlines()[-6:])
+            self.patch_status_var.set(tail or ("Done." if result.returncode == 0 else f"Failed (exit {result.returncode})."))
+        except Exception as exc:
+            self.patch_status_var.set(f"Could not run apply-en-patch.sh: {exc}")
+
+    def _apply_en_patch(self):
+        self._run_en_patch_script([], "Applying the English patch...")
+
+    def _revert_en_patch(self):
+        if not messagebox.askyesno("Revert EN Patch",
+                                    "Restore the install to how it was before the English patch was applied?\n\n"
+                                    "This uses the most recent _en-patch-backup snapshot."):
+            return
+        self._run_en_patch_script(["--rollback"], "Reverting the English patch...")
 
     def _run_setup(self):
         script = Path(__file__).resolve().parent.parent / "setup.sh"
@@ -599,8 +954,10 @@ class DisplayTab(ttk.Frame):
         notebook.pack(fill="both", expand=True)
         basic = ttk.Frame(notebook, padding=12)
         advanced = ttk.Frame(notebook, padding=12)
+        audio = ttk.Frame(notebook, padding=16)
         notebook.add(basic, text="Basic")
         notebook.add(advanced, text="Advanced Graphics")
+        notebook.add(audio, text="Audio")
 
         row = 0
         ttk.Label(basic, text="Resolution:").grid(row=row, column=0, sticky="w", pady=4)
@@ -720,6 +1077,43 @@ class DisplayTab(ttk.Frame):
         ttk.Combobox(advanced, textvariable=self.hide_ui_key_var, values=key_names,
                      state="readonly", width=18).grid(row=row, column=1, sticky="w")
 
+        # App/audio-volume.ini - a separate file scooby's own
+        # AudioSettingsView reads/writes, applied live by the running game
+        # (not something fgo-launcher.sh needs to inject at launch).
+        audio_values = load_audio_volume()
+        self.volume_vars = {}
+        arow = 0
+        ttk.Label(audio, text="Applied live while the game is running.", foreground="gray").grid(
+            row=arow, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        arow += 1
+        for label, key in (("Music (BGM):", "bgm"), ("Voice:", "voice"), ("Sound Effects:", "effects")):
+            ttk.Label(audio, text=label, width=16).grid(row=arow, column=0, sticky="w", pady=6)
+            # ttk.Scale reports continuous float positions (no "resolution"
+            # snapping like classic tk.Scale) - an IntVar.get() would raise
+            # TclError the first time the scale lands on a non-integer value.
+            var = tk.DoubleVar(value=audio_values[key])
+            self.volume_vars[key] = var
+            scale = ttk.Scale(audio, from_=0, to=100, orient="horizontal", variable=var, length=260)
+            scale.grid(row=arow, column=1, sticky="w")
+            value_label = ttk.Label(audio, width=4)
+            value_label.grid(row=arow, column=2, sticky="w", padx=(8, 0))
+
+            def update_label(v, lbl=value_label, var=var):
+                lbl.configure(text=str(int(round(var.get()))))
+
+            var.trace_add("write", lambda *_a, u=update_label: u(None))
+            update_label(None)
+            arow += 1
+        audio_buttons = ttk.Frame(audio)
+        audio_buttons.grid(row=arow, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ttk.Button(audio_buttons, text="Mute All", command=lambda: self._set_all_volume(0)).pack(side="left")
+        ttk.Button(audio_buttons, text="Restore Defaults", command=lambda: self._set_all_volume(100)).pack(
+            side="left", padx=(8, 0))
+
+    def _set_all_volume(self, value):
+        for var in self.volume_vars.values():
+            var.set(value)
+
     def validate(self):
         try:
             width = int(self.width_var.get())
@@ -790,6 +1184,7 @@ class DisplayTab(ttk.Frame):
         })
         self.config_data["graphics"] = self.graphics_data
         save_launcher_json(self.config_data)
+        save_audio_volume({key: int(round(var.get())) for key, var in self.volume_vars.items()})
 
     def play_env(self):
         env = {}
@@ -1091,8 +1486,7 @@ class NewAccountDialog(tk.Toplevel):
         buttons.grid(row=4, column=0, columnspan=2, pady=10)
         ttk.Button(buttons, text="Create", command=self._create).pack(side="left", padx=4)
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=4)
-        self.transient(parent)
-        self.grab_set()
+        _make_modal(self, parent)
 
     def _create(self):
         name = self.name_var.get().strip()
@@ -1146,8 +1540,7 @@ class GrantItemsDialog(tk.Toplevel):
         self.status_var = tk.StringVar(value="Loading catalog...")
         ttk.Label(self, textvariable=self.status_var, foreground="gray").pack(anchor="w", padx=10, pady=(0, 6))
         self.after(50, self._load_catalog)
-        self.transient(parent)
-        self.grab_set()
+        _make_modal(self, parent)
 
     def _load_catalog(self):
         try:
@@ -1406,11 +1799,12 @@ class CardDetailDialog(tk.Toplevel):
     entry in owned_cards/deck.json. Lets you set a quantity per variant in
     one place instead of hunting each one down in the grid."""
 
-    def __init__(self, parent, card, variants, selected, thumbnail_fn):
+    def __init__(self, parent, card, variants, selected, thumbnail_fn, max_addable=30):
         super().__init__(parent)
         self.selected = selected
         self.changed = False
         self.qty_vars = {}
+        self.max_addable = max_addable
         name = DeckTab._display_name(card)
         japanese = TRANSLATIONS.japanese_name(card)
         internal_id = TRANSLATIONS.internal_id(card) or "?"
@@ -1444,6 +1838,9 @@ class CardDetailDialog(tk.Toplevel):
                 ttk.Label(effect_frame, text=effect["Maximum"], wraplength=420).pack(anchor="w")
                 ttk.Label(effect_frame, text=effect.get("MaximumJapanese", ""), foreground="gray", wraplength=420).pack(anchor="w")
 
+        ttk.Label(self, text=f"{self.max_addable} slot(s) left in the deck.", foreground="gray").pack(
+            anchor="w", padx=12, pady=(0, 4))
+
         table = ttk.Frame(self, padding=(12, 0))
         table.pack(fill="both", expand=True)
         headers = ["Variant", "Owned", "In Deck", "Quantity"]
@@ -1458,16 +1855,37 @@ class CardDetailDialog(tk.Toplevel):
             ttk.Label(table, text=str(current_qty)).grid(row=row, column=2, padx=6)
             qty_var = tk.IntVar(value=current_qty)
             self.qty_vars[file_name] = (qty_var, variant)
-            ttk.Spinbox(table, from_=0, to=max(owned, 0), textvariable=qty_var, width=6).grid(row=row, column=3, padx=6)
+            # Each row is one physical/virtual card file - at most 1 of any
+            # single exact variant ever goes in the deck (this matches
+            # scooby's own CardVariantsWindow.Choice.Maximum: it's always
+            # min(remaining deck slots, 1), never tied to how many spare
+            # copies the account owns - "Owned x12" just means spares/trade
+            # fodder, not stackable deck copies of the identical card. Not
+            # gated on ownership at all either, since scooby itself lets you
+            # plan a deck with any card in the roster - see the module
+            # docstring's note on this exact point.
+            row_max = max(0, min(self.max_addable, 1))
+            ttk.Spinbox(table, from_=0, to=max(row_max, current_qty), textvariable=qty_var, width=6).grid(
+                row=row, column=3, padx=6)
+
+        self.error_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.error_var, foreground="#c0392b", wraplength=440).pack(
+            anchor="w", padx=12, pady=(4, 0))
 
         buttons = ttk.Frame(self, padding=12)
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(buttons, text="Add Selected Quantities", command=self._apply).pack(side="right", padx=(0, 8))
-        self.transient(parent)
-        self.grab_set()
+        _make_modal(self, parent)
 
     def _apply(self):
+        # Matches scooby's own Add_OnClick: the total added/kept across this
+        # dialog's own rows can't exceed the deck slots that were free when
+        # it opened (other cards elsewhere in the deck aren't touched here).
+        new_total = sum(qty_var.get() for qty_var, _ in self.qty_vars.values())
+        if new_total > self.max_addable:
+            self.error_var.set(f"Choose at most {self.max_addable} card(s) here - {new_total} selected.")
+            return
         for file_name, (qty_var, variant) in self.qty_vars.items():
             qty = qty_var.get()
             if qty > 0:
@@ -1588,14 +2006,28 @@ class DeckTab(ttk.Frame):
         self.grid_canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
         self.grid_frame.bind("<Configure>", lambda e: self.grid_canvas.configure(scrollregion=self.grid_canvas.bbox("all")))
 
-        side = ttk.Frame(body, width=240)
-        side.pack(side="left", fill="y", padx=(10, 0))
+        # Scrollable, not a plain fixed-height Frame - this side panel (deck
+        # status/list + Loadouts row) is tall enough that a plain pack() cuts
+        # its bottom buttons off below the window edge on a lot of window
+        # sizes; a canvas+scrollbar guarantees everything's reachable
+        # regardless of how short the window ends up.
+        side_container = ttk.Frame(body, width=250)
+        side_container.pack(side="left", fill="y", padx=(10, 0))
+        side_container.pack_propagate(False)
+        side_canvas = tk.Canvas(side_container, highlightthickness=0, width=232)
+        side_scroll = ttk.Scrollbar(side_container, orient="vertical", command=side_canvas.yview)
+        side_canvas.configure(yscrollcommand=side_scroll.set)
+        side_scroll.pack(side="right", fill="y")
+        side_canvas.pack(side="left", fill="both", expand=True)
+        side = ttk.Frame(side_canvas)
+        side_canvas.create_window((0, 0), window=side, anchor="nw", width=232)
+        side.bind("<Configure>", lambda e: side_canvas.configure(scrollregion=side_canvas.bbox("all")))
         self.deck_status_var = tk.StringVar(value="0 of 30 cards")
         ttk.Label(side, textvariable=self.deck_status_var, font=("", 10, "bold")).pack(anchor="w")
         ttk.Button(side, text="Clear Deck", command=self._clear_deck).pack(fill="x", pady=(2, 8))
         ttk.Label(side, text="Selected deck:").pack(anchor="w")
-        self.selected_list = tk.Listbox(side, width=32, height=14)
-        self.selected_list.pack(fill="both", expand=True)
+        self.selected_list = tk.Listbox(side, width=30, height=10)
+        self.selected_list.pack(fill="x")
         ttk.Button(side, text="Remove selected", command=self._remove_from_deck_list).pack(fill="x", pady=(4, 0))
         ttk.Button(side, text="Save Deck", command=self.save).pack(fill="x", pady=(4, 0))
 
@@ -1947,7 +2379,14 @@ class DeckTab(ttk.Frame):
         self._refresh_selected_list()
 
     def _open_detail(self, entity):
-        dialog = CardDetailDialog(self.winfo_toplevel(), entity["card"], entity["variants"], self.selected, self._thumbnail)
+        # Matches scooby's own CardVariantsWindow: "slots" is the deck's
+        # remaining capacity computed once at open time from the *whole*
+        # current deck (including this entity's own already-selected
+        # variants, if any) - not just the deck size minus this entity.
+        current_total = sum(e["qty"].get() for e in self.selected.values())
+        max_addable = max(0, self.MAX_DECK_SIZE - current_total)
+        dialog = CardDetailDialog(self.winfo_toplevel(), entity["card"], entity["variants"], self.selected,
+                                   self._thumbnail, max_addable=max_addable)
         self.wait_window(dialog)
         if dialog.changed:
             self._render_current_page()
@@ -2141,21 +2580,331 @@ class DeckTab(ttk.Frame):
             messagebox.showinfo("Open folder", str(folder))
 
 
+class DrawRatesTab(ttk.Frame):
+    """Server/artemis's own local summon-weight lottery
+    (Server/artemis/titles/fgo/summon_weights.py) - a flat weighted pool
+    across every eligible Servant/CE base print (no story-only entries, no
+    holo/alt-art variants - those were never summonable at all, not
+    something this tab is hiding). Not a retail probability table, and not
+    scooby's own UI at all - scooby has no Draw Rates view of its own; this
+    reads/writes the same server config file directly. Requires restarting
+    the local server (linux/stop-fgo-local-server.sh then
+    start-fgo-local-server.sh - this GUI doesn't start/stop it itself) to
+    take effect."""
+
+    PAGE_SIZE = 40
+    THUMB_SIZE = (56, 86)
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=12)
+        self.thumb_cache = {}
+        self.cards = []
+        self.weights = {}
+        self.weight_vars = {}
+        self.filtered = []
+        self.page = 0
+        self.cards_path = install_root() / "DEVICE" / "print" / "FGO11_AllServants"
+
+        if not HAVE_PIL:
+            ttk.Label(self, text="Pillow (python3-Pillow) is required for card artwork here - install it and restart.",
+                      foreground="red", wraplength=500).pack(padx=8, pady=8)
+            return
+
+        ttk.Label(self, text="Local simulation weights, not a retail probability table. A weight of 0 removes "
+                              "a card from the pool entirely; equal nonzero weights split evenly. Restart the "
+                              "local server (stop-fgo-local-server.sh, then start-fgo-local-server.sh - this "
+                              "GUI doesn't start/stop it itself) after saving for changes to take effect.",
+                  foreground="gray", wraplength=780).pack(anchor="w", pady=(0, 8))
+
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill="x")
+        ttk.Label(toolbar, text="Show").pack(side="left")
+        self.show_var = tk.StringVar(value="All Cards")
+        ttk.Combobox(toolbar, textvariable=self.show_var, values=[n for n, _ in CARD_TYPE_CHOICES],
+                     state="readonly", width=14).pack(side="left", padx=(4, 12))
+        self.show_var.trace_add("write", lambda *_: self._apply_filter())
+        ttk.Label(toolbar, text="Sort").pack(side="left")
+        self.sort_var = tk.StringVar(value="Name")
+        ttk.Combobox(toolbar, textvariable=self.sort_var, values=["Name", "Rarity", "TC ID"],
+                     state="readonly", width=10).pack(side="left", padx=(4, 12))
+        self.sort_var.trace_add("write", lambda *_: self._apply_filter())
+        ttk.Label(toolbar, text="Search:").pack(side="left", padx=(8, 0))
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._apply_filter())
+        ttk.Entry(toolbar, textvariable=self.search_var, width=24).pack(side="left", padx=(4, 0))
+
+        bulk = ttk.Frame(self)
+        bulk.pack(fill="x", pady=(6, 0))
+        ttk.Label(bulk, text="Set all shown to:").pack(side="left")
+        self.bulk_value_var = tk.StringVar(value="1")
+        ttk.Entry(bulk, textvariable=self.bulk_value_var, width=8).pack(side="left", padx=(4, 6))
+        ttk.Button(bulk, text="Apply", command=self._bulk_set_shown).pack(side="left")
+        ttk.Button(bulk, text="Disable shown (0)", command=lambda: self._bulk_set_shown(0)).pack(side="left", padx=(8, 0))
+        ttk.Button(bulk, text="Reset shown to 1", command=lambda: self._bulk_set_shown(1)).pack(side="left", padx=(4, 0))
+
+        self.summary_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.summary_var, foreground="gray").pack(anchor="w", pady=(8, 4))
+
+        nav = ttk.Frame(self)
+        nav.pack(fill="x")
+        self.page_label_var = tk.StringVar(value="")
+        ttk.Label(nav, textvariable=self.page_label_var).pack(side="left")
+        ttk.Button(nav, text="< Prev", command=self._prev_page).pack(side="left", padx=(12, 0))
+        ttk.Button(nav, text="Next >", command=self._next_page).pack(side="left", padx=(4, 0))
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, pady=(8, 0))
+        self.list_canvas = tk.Canvas(body, highlightthickness=0)
+        list_scroll = ttk.Scrollbar(body, orient="vertical", command=self.list_canvas.yview)
+        self.list_canvas.configure(yscrollcommand=list_scroll.set)
+        list_scroll.pack(side="right", fill="y")
+        self.list_canvas.pack(side="left", fill="both", expand=True)
+        self.list_frame = ttk.Frame(self.list_canvas)
+        self.list_canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        self.list_frame.bind("<Configure>", lambda e: self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all")))
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", pady=(8, 0))
+        ttk.Button(bottom, text="Save Weights", command=self.save).pack(side="left")
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(bottom, textvariable=self.status_var, foreground="gray").pack(side="left", padx=(12, 0))
+
+        self.reload()
+
+    def reload(self):
+        self.cards = load_summon_candidates()
+        eligible_ids = {c["tc_id"] for c in self.cards}
+        self.weights = load_summon_weights(eligible_ids)
+        self._apply_filter()
+
+    def _apply_filter(self):
+        if not hasattr(self, "summary_var"):
+            return  # HAVE_PIL was False - no widgets were built at all
+        show_type = {n: v for n, v in CARD_TYPE_CHOICES}.get(self.show_var.get(), 0)
+        query = self.search_var.get().strip().lower()
+
+        def matches(card):
+            if show_type and card["card_type_id"] != show_type:
+                return False
+            if not query:
+                return True
+            name = DeckTab._display_name(card).lower()
+            internal_id = (TRANSLATIONS.internal_id(card) or "").lower()
+            return query in name or query in internal_id or query in str(card["tc_id"])
+
+        filtered = [c for c in self.cards if matches(c)]
+        sort_mode = self.sort_var.get()
+        if sort_mode == "Name":
+            filtered.sort(key=lambda c: DeckTab._display_name(c).lower())
+        elif sort_mode == "Rarity":
+            filtered.sort(key=lambda c: (-c.get("rarity", 0), DeckTab._display_name(c).lower()))
+        elif sort_mode == "TC ID":
+            filtered.sort(key=lambda c: c["tc_id"])
+        self.filtered = filtered
+        self.page = 0
+        self._render_page()
+
+        servant_total = sum(1 for c in self.cards if c["card_type_id"] == 1)
+        ce_total = sum(1 for c in self.cards if c["card_type_id"] == 2)
+        nonzero = sum(1 for w in self.weights.values() if w > 0)
+        self.summary_var.set(f"Servants {servant_total:,} / Craft Essences {ce_total:,} eligible - "
+                              f"{len(filtered):,} shown - {nonzero:,} currently in the pool (nonzero weight)")
+
+    def _prev_page(self):
+        if self.page > 0:
+            self.page -= 1
+            self._render_page()
+
+    def _next_page(self):
+        if (self.page + 1) * self.PAGE_SIZE < len(self.filtered):
+            self.page += 1
+            self._render_page()
+
+    def _thumbnail(self, card):
+        file_name = card["file_name"]
+        if not file_name:
+            return None
+        if file_name in self.thumb_cache:
+            return self.thumb_cache[file_name]
+        try:
+            image = Image.open(self.cards_path / file_name)
+            image.thumbnail(self.THUMB_SIZE)
+            photo = ImageTk.PhotoImage(image)
+        except (OSError, ValueError):
+            photo = None
+        self.thumb_cache[file_name] = photo
+        return photo
+
+    def _render_page(self):
+        for child in self.list_frame.winfo_children():
+            child.destroy()
+        self.weight_vars = {}
+        start = self.page * self.PAGE_SIZE
+        for card in self.filtered[start:start + self.PAGE_SIZE]:
+            tc_id = card["tc_id"]
+            row = ttk.Frame(self.list_frame, padding=4)
+            row.pack(fill="x", pady=1)
+            photo = self._thumbnail(card)
+            if photo is not None:
+                thumb = tk.Label(row, image=photo)
+                thumb.image = photo
+            else:
+                thumb = tk.Label(row, text="(no image)", width=8, height=4)
+            thumb.grid(row=0, column=0, rowspan=2, padx=(0, 10))
+            ttk.Label(row, text=DeckTab._display_name(card), font=("", 10, "bold")).grid(row=0, column=1, sticky="w")
+            type_label = "Servant" if card["card_type_id"] == 1 else "Craft Essence"
+            rarity = card.get("rarity", 0)
+            stars = ("*" * rarity) if rarity else "?"
+            ttk.Label(row, text=f"{type_label} - {stars} - TC {tc_id}", foreground="gray").grid(
+                row=1, column=1, sticky="w")
+            row.grid_columnconfigure(1, weight=1)
+            ttk.Label(row, text="Weight:").grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 4))
+            var = tk.StringVar(value=str(self.weights.get(tc_id, 0)))
+            self.weight_vars[tc_id] = var
+            spin = ttk.Spinbox(row, from_=0, to=MAX_SUMMON_WEIGHT, textvariable=var, width=10)
+            spin.grid(row=0, column=3, rowspan=2, sticky="e")
+            spin.bind("<FocusOut>", lambda e, tc=tc_id, v=var: self._commit_weight(tc, v))
+            spin.bind("<Return>", lambda e, tc=tc_id, v=var: self._commit_weight(tc, v))
+        total_pages = max(1, (len(self.filtered) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page_label_var.set(f"Page {self.page + 1}/{total_pages}")
+
+    def _commit_weight(self, tc_id, var):
+        try:
+            value = max(0, min(MAX_SUMMON_WEIGHT, int(var.get())))
+        except ValueError:
+            value = self.weights.get(tc_id, 0)
+        var.set(str(value))
+        self.weights[tc_id] = value
+
+    def _bulk_set_shown(self, value=None):
+        if value is None:
+            try:
+                value = max(0, min(MAX_SUMMON_WEIGHT, int(self.bulk_value_var.get())))
+            except ValueError:
+                self.status_var.set("Enter a whole number from 0 to 1,000,000 first.")
+                return
+        for card in self.filtered:
+            self.weights[card["tc_id"]] = value
+        self._render_page()
+        self.status_var.set(f"Set {len(self.filtered):,} shown card(s) to weight {value}. Remember to Save.")
+
+    def save(self):
+        for tc_id, var in self.weight_vars.items():
+            self._commit_weight(tc_id, var)
+        try:
+            save_summon_weights(self.weights)
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        self.status_var.set("Saved. Restart the local server (stop-fgo-local-server.sh, then "
+                             "start-fgo-local-server.sh) for changes to take effect.")
+
+
+class BannersTab(ttk.Frame):
+    """scooby calls this "Banners", but it's actually a Limited-Time-Event
+    (LTE) story/menu VISIBILITY filter, not gacha pool/rate editing (that's
+    the Draw Rates tab above - a separate, unrelated system). Checking one
+    or more events here hides every OTHER event's story nodes/banners from
+    the in-game Terminal; checking none shows everything (no filter).
+
+    Needs a one-time source patch to two ARTEMiS Python files before the
+    checkboxes do anything at all - the base install has no
+    enabled_singularity_ids concept until it's patched in. That patch
+    changes server source code (with a .bak alongside each file it touches,
+    plus a py_compile check that auto-restores on failure) - deliberately
+    left as an explicit button rather than applied automatically."""
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=16)
+        self.vars = {}
+
+        header = ttk.Frame(self)
+        header.pack(fill="x", pady=(0, 10))
+        self.patch_status_var = tk.StringVar(value=self._describe_status(event_toggle_status()))
+        ttk.Label(header, textvariable=self.patch_status_var, foreground="gray", wraplength=760).pack(anchor="w")
+        ttk.Button(header, text="Apply Event Toggle Patch", command=self._apply_patch).pack(anchor="w", pady=(6, 0))
+
+        ttk.Label(self, text="Checking one or more events below hides every OTHER event's story nodes/menus "
+                              "in-game. Checking none shows everything (no filter). Restart the local server "
+                              "(stop-fgo-local-server.sh, then start-fgo-local-server.sh - this GUI doesn't "
+                              "start/stop it itself) after Save for this to take effect.",
+                  foreground="gray", wraplength=760).pack(anchor="w", pady=(0, 10))
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", pady=(0, 6))
+        ttk.Button(actions, text="Save", command=self.save).pack(side="left")
+        ttk.Button(actions, text="Clear All (show everything)", command=self._clear_all).pack(side="left", padx=(8, 0))
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=self.status_var, foreground="gray").pack(side="left", padx=(12, 0))
+
+        list_container = ttk.Frame(self)
+        list_container.pack(fill="both", expand=True)
+        canvas = tk.Canvas(list_container, highlightthickness=0)
+        scroll = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        enabled_ids = load_enabled_singularity_ids()
+        for lte_id, label in EVENT_TOGGLE_IDS:
+            var = tk.BooleanVar(value=lte_id in enabled_ids)
+            self.vars[lte_id] = var
+            ttk.Checkbutton(inner, text=f"LTE{lte_id} - {label}", variable=var).pack(anchor="w", pady=2)
+
+    @staticmethod
+    def _describe_status(status):
+        if all(v is True for v in status.values()):
+            return "Event Toggle Patch: applied."
+        if any(v is None for v in status.values()):
+            missing = ", ".join(k for k, v in status.items() if v is None)
+            return f"Event Toggle Patch: not applied - target file(s) not found ({missing})."
+        return "Event Toggle Patch: not applied yet - the checkboxes below do nothing until this runs."
+
+    def _apply_patch(self):
+        try:
+            messages = apply_event_toggle_patch()
+        except Exception as exc:
+            self.patch_status_var.set(f"Could not apply the patch: {exc}")
+            return
+        self.patch_status_var.set("\n".join(messages) + "\n" + self._describe_status(event_toggle_status()))
+
+    def _clear_all(self):
+        for var in self.vars.values():
+            var.set(False)
+
+    def save(self):
+        ids = {lte_id for lte_id, var in self.vars.items() if var.get()}
+        try:
+            save_enabled_singularity_ids(ids)
+        except Exception as exc:
+            self.status_var.set(f"Could not save: {exc}")
+            return
+        restart_hint = ("Restart the local server (stop-fgo-local-server.sh, then "
+                         "start-fgo-local-server.sh) for this to take effect.")
+        if ids:
+            self.status_var.set(f"Saved - {len(ids)} event(s) allowed, everything else hidden. {restart_hint}")
+        else:
+            self.status_var.set(f"Saved - no filter (everything shows). {restart_hint}")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         root = install_root_or_none()
         self.title(f"FGO Arcade settings - {root or '(no install configured)'}")
-        self.geometry("900x680")
+        self.geometry("980x760")
+        self.minsize(760, 560)
 
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
         self.setup_tab = SetupTab(self.notebook, on_saved=self._on_setup_saved)
         self.notebook.add(self.setup_tab, text="Setup")
 
         self.display_tab = self.controls_tab = self.server_tab = None
-        self.account_tab = self.deck_tab = None
+        self.account_tab = self.deck_tab = self.draw_rates_tab = self.banners_tab = None
         if root is not None:
             self._build_install_tabs()
         else:
@@ -2165,12 +2914,20 @@ class App(tk.Tk):
                       justify="center").pack(expand=True)
             self.notebook.add(placeholder, text="(configure Setup first)")
 
-        button_row = ttk.Frame(self, padding=(8, 0, 8, 8))
-        button_row.pack(fill="x")
+        # Packed (and its side="bottom" set) before the notebook, so it
+        # always keeps its space at the bottom of the window regardless of
+        # how tall the notebook's own content is - previously the notebook
+        # was packed first with expand=True and claimed the window outright,
+        # leaving this row clipped off-screen below the window's bottom edge
+        # on the default (or a manually shrunk) window size.
+        button_row = ttk.Frame(self, padding=(8, 6, 8, 8))
+        button_row.pack(side="bottom", fill="x")
         ttk.Button(button_row, text="Save", command=self.on_save).pack(side="left")
         ttk.Button(button_row, text="Save && Play", command=self.on_play).pack(side="left", padx=(8, 0))
         self.status_var = tk.StringVar(value="")
         ttk.Label(button_row, textvariable=self.status_var, foreground="gray").pack(side="left", padx=(16, 0))
+
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
     def _build_install_tabs(self):
         self.display_tab = DisplayTab(self.notebook)
@@ -2178,11 +2935,15 @@ class App(tk.Tk):
         self.server_tab = ServerTab(self.notebook)
         self.account_tab = AccountTab(self.notebook)
         self.deck_tab = DeckTab(self.notebook)
-        self.notebook.add(self.display_tab, text="Display")
+        self.draw_rates_tab = DrawRatesTab(self.notebook)
+        self.banners_tab = BannersTab(self.notebook)
+        self.notebook.add(self.display_tab, text="Game Settings")
         self.notebook.add(self.controls_tab, text="Controls")
         self.notebook.add(self.server_tab, text="Server")
         self.notebook.add(self.account_tab, text="Account")
         self.notebook.add(self.deck_tab, text="Deck")
+        self.notebook.add(self.draw_rates_tab, text="Draw Rates")
+        self.notebook.add(self.banners_tab, text="Banners")
 
     def _on_setup_saved(self):
         if install_root_or_none() is not None and self.display_tab is None:
