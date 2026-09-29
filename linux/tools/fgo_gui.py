@@ -20,6 +20,8 @@ placeholder until a valid install root is set.
 """
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tkinter as tk
@@ -38,6 +40,7 @@ except ImportError:
 
 try:
     import evdev
+    from evdev import ff
     HAVE_EVDEV = True
 except ImportError:
     HAVE_EVDEV = False
@@ -57,6 +60,11 @@ XINPUT_CHOICES = [
 ]
 XINPUT_VALUE_TO_NAME = {v: n for n, v in XINPUT_CHOICES}
 
+# xinput's "movement" key (which physical input drives on-field movement) -
+# scooby's own MovementSelector, 0-indexed.
+MOVEMENT_CHOICES = [("Left Stick", 0), ("Right Stick", 1), ("D-Pad", 2)]
+MOVEMENT_VALUE_TO_NAME = {v: n for n, v in MOVEMENT_CHOICES}
+
 # Standard xpad-driver (Xbox-compatible) evdev button codes -> XInput mask.
 # Covers the common case (this is what shows up for the vast majority of
 # wired/wireless pads once the kernel recognizes them as Xbox-compatible,
@@ -74,6 +82,37 @@ EVDEV_BUTTON_TO_XINPUT = {
     evdev.ecodes.BTN_START if HAVE_EVDEV else 315: 0x0010,   # Start
     evdev.ecodes.BTN_SELECT if HAVE_EVDEV else 314: 0x0020,  # Back
 }
+
+
+def _ff_devices():
+    """Force-feedback-capable evdev devices, ordered by /dev/input/eventN -
+    a best-effort stand-in for however Wine's own XInput backend numbers
+    connected pads (there's no way to query that ordering from here), used
+    only to let "Vibrate to test" identify roughly the right physical pad."""
+    devices = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            continue
+        if evdev.ecodes.EV_FF in dev.capabilities():
+            devices.append(dev)
+    match = re.compile(r"(\d+)$")
+    devices.sort(key=lambda d: int(match.search(d.path).group()) if match.search(d.path) else 0)
+    return devices
+
+
+def _rumble_device(dev, duration_ms=600, strength=0xFFFF):
+    effect = ff.Effect(
+        evdev.ecodes.FF_RUMBLE, -1, 0,
+        ff.Trigger(0, 0),
+        ff.Replay(duration_ms, 0),
+        ff.EffectType(ff_rumble_effect=ff.Rumble(strong_magnitude=strength, weak_magnitude=strength)),
+    )
+    effect_id = dev.upload_effect(effect)
+    dev.write(evdev.ecodes.EV_FF, effect_id, 1)
+    return effect_id
+
 
 # Keyboard choices: (label, Windows virtual-key code). Covers what a game
 # control scheme realistically uses - not an exhaustive VK table.
@@ -113,6 +152,24 @@ XINPUT_ACTIONS = [
 ]
 
 DISPLAY_MODES = [("Windowed", "windowed"), ("Borderless", "borderless"), ("Exclusive fullscreen", "exclusive")]
+
+# Advanced graphics choices - values/labels match scooby's own MainWindow.xaml
+# (SmaaComboBox/AnisotropyComboBox/RenderScaleComboBox/ShadowResolutionComboBox)
+# exactly, so a setting picked here reads the same in either tool.
+SMAA_CHOICES = [("Off (native)", 0), ("Native + SMAA High", 1), ("Native + SMAA Ultra", 2)]
+SMAA_VALUE_TO_NAME = {v: n for n, v in SMAA_CHOICES}
+ANISOTROPY_CHOICES = [("1x", 1), ("2x", 2), ("4x", 4), ("8x", 8), ("16x", 16)]
+ANISOTROPY_VALUE_TO_NAME = {v: n for n, v in ANISOTROPY_CHOICES}
+RENDER_SCALE_CHOICES = [("100% (native)", 100), ("125% (1.56x pixels)", 125),
+                         ("150% (2.25x pixels)", 150), ("200% (4x pixels)", 200)]
+RENDER_SCALE_VALUE_TO_NAME = {v: n for n, v in RENDER_SCALE_CHOICES}
+SHADOW_RESOLUTION_CHOICES = [("Game default", 0), ("1024 x 1024", 1024), ("2048 x 2048", 2048), ("4096 x 4096", 4096)]
+SHADOW_RESOLUTION_VALUE_TO_NAME = {v: n for n, v in SHADOW_RESOLUTION_CHOICES}
+
+# Deck tab "Show"/"Sort" choices - match scooby's own CardTypeComboBox/
+# CardSortComboBox (mainwindow.xaml) tag values exactly.
+CARD_TYPE_CHOICES = [("All Cards", 0), ("Servants", 1), ("Craft Essences", 2)]
+CARD_SORT_CHOICES = [("Folder order", 0), ("Name", 1), ("Card number", 2)]
 
 
 def is_valid_install(path_str):
@@ -212,11 +269,78 @@ def deck_json_path():
     return install_root() / "App" / "deck.json"
 
 
+def loadout_folder():
+    return install_root() / "App" / "deck-loadouts"
+
+
+def card_manifest_path():
+    # Fixed location - unlike deck.json's own (overridable) CardsPath, this
+    # is exactly where fgo_account.py's own load_card_manifest_by_id() reads
+    # it from (Server/tools/fgo_account.py), so it's always the same file
+    # the account tool itself uses to resolve tc_id -> card metadata.
+    return install_root() / "DEVICE" / "print" / "FGO11_AllServants" / "library-manifest.json"
+
+
+def load_card_catalog():
+    """The full card roster (owned or not) - tc_id -> a dict in the exact
+    same shape fgo_account.py's own owned_cards entries use, straight from
+    the game's own library-manifest.json (not generated or guessed at here).
+    Every entry starts at count 0; DeckTab overlays the account's real
+    owned counts on top. Missing/unreadable just means "All Cards" can only
+    show what's actually owned - the same as before this existed."""
+    try:
+        manifest = json.loads(card_manifest_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    catalog = {}
+    for card in manifest.get("Cards", []):
+        if not isinstance(card, dict):
+            continue
+        try:
+            tc_id = int(card["TradingCardId"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        catalog[tc_id] = {
+            "tc_id": tc_id,
+            "count": 0,
+            "card_type_id": int(card.get("CardTypeId", 1)),
+            "servant_id": int(card.get("ServantId", 0)),
+            "craft_essence_id": int(card.get("CraftEssenceId", 0)),
+            "display_name": str(card.get("DisplayName", f"Trading Card {tc_id}")),
+            "file_name": str(card.get("FileName", "")),
+        }
+    return catalog
+
+
+def _patch_fgo_account_windows_only_check():
+    """fgo_account.py's own purge_player_prints() (run on every account
+    delete) checks a Windows-only NTFS reparse-point attribute
+    (os.stat_result.st_file_attributes) that doesn't exist under Linux's
+    os.stat() at all - AttributeError on every single delete when run with
+    our native FGO_PYTHON instead of the game's bundled Windows python.exe.
+    Patched in place, staying Windows-identical wherever the attribute
+    exists (a no-op there) and simply skipping the reparse-point check where
+    it doesn't (is_symlink() alongside it already covers Linux's own
+    equivalent). Idempotent - cheap to re-check before every call, so a
+    fresh/regenerated install reintroducing the unpatched file self-heals
+    without needing a separate one-time setup step."""
+    path = account_tool_path()
+    broken = "p.stat().st_file_attributes & 0x400"
+    fixed = 'getattr(p.stat(), "st_file_attributes", 0) & 0x400'
+    try:
+        text = path.read_text(encoding="utf-8")
+        if broken in text:
+            path.write_text(text.replace(broken, fixed), encoding="utf-8")
+    except OSError:
+        pass  # best-effort - the real subprocess call below will surface any actual problem
+
+
 def run_account_tool(*args, timeout=30):
     """Runs fgo_account.py with our own native FGO_PYTHON (the ARTEMiS venv -
     this script imports artemis's own core/titles modules, same as when the
     real server runs) rather than the game's bundled Windows python.exe under
     Wine - confirmed working identically, no Wine round-trip needed."""
+    _patch_fgo_account_windows_only_check()
     result = subprocess.run(
         [fgo_python(), str(account_tool_path()), *args, "--json"],
         capture_output=True, text=True, timeout=timeout,
@@ -461,50 +585,140 @@ class SetupTab(ttk.Frame):
 
 
 class DisplayTab(ttk.Frame):
+    """monitorDevice is deliberately not exposed here (per-machine, fiddly to
+    get right, and fgo-launcher.sh fgo_die()s on an invalid value) -
+    config_data still carries whatever's already on disk and save() never
+    touches that key, so it round-trips untouched."""
+
     def __init__(self, parent):
         super().__init__(parent, padding=16)
         self.config_data = load_launcher_json()
+        self.graphics_data = self.config_data.setdefault("graphics", {})
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True)
+        basic = ttk.Frame(notebook, padding=12)
+        advanced = ttk.Frame(notebook, padding=12)
+        notebook.add(basic, text="Basic")
+        notebook.add(advanced, text="Advanced Graphics")
 
         row = 0
-        ttk.Label(self, text="Resolution:").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Label(basic, text="Resolution:").grid(row=row, column=0, sticky="w", pady=4)
         self.width_var = tk.StringVar(value=str(self.config_data.get("resolutionWidth", 1280)))
         self.height_var = tk.StringVar(value=str(self.config_data.get("resolutionHeight", 720)))
-        ttk.Entry(self, textvariable=self.width_var, width=8).grid(row=row, column=1, sticky="w")
-        ttk.Label(self, text="x").grid(row=row, column=2)
-        ttk.Entry(self, textvariable=self.height_var, width=8).grid(row=row, column=3, sticky="w")
+        ttk.Entry(basic, textvariable=self.width_var, width=8).grid(row=row, column=1, sticky="w")
+        ttk.Label(basic, text="x").grid(row=row, column=2)
+        ttk.Entry(basic, textvariable=self.height_var, width=8).grid(row=row, column=3, sticky="w")
         row += 1
 
-        ttk.Label(self, text="Display mode:").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Label(basic, text="Display mode:").grid(row=row, column=0, sticky="w", pady=4)
         self.mode_var = tk.StringVar(value=self.config_data.get("displayMode", "windowed"))
         mode_names = [n for n, _ in DISPLAY_MODES]
         mode_by_name = dict(DISPLAY_MODES)
         name_by_mode = {v: n for n, v in DISPLAY_MODES}
         self.mode_display = tk.StringVar(value=name_by_mode.get(self.mode_var.get(), mode_names[0]))
-        combo = ttk.Combobox(self, textvariable=self.mode_display, values=mode_names, state="readonly", width=20)
+        combo = ttk.Combobox(basic, textvariable=self.mode_display, values=mode_names, state="readonly", width=20)
         combo.grid(row=row, column=1, columnspan=3, sticky="w")
         self._mode_by_name = mode_by_name
         row += 1
 
-        ttk.Label(self, text="Target FPS:").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Label(basic, text="Target FPS:").grid(row=row, column=0, sticky="w", pady=4)
         self.fps_var = tk.StringVar(value=str(self.config_data.get("targetFps", 60)))
-        ttk.Entry(self, textvariable=self.fps_var, width=8).grid(row=row, column=1, sticky="w")
-        row += 1
-
-        ttk.Label(self, text="Monitor device:").grid(row=row, column=0, sticky="w", pady=4)
-        self.monitor_var = tk.StringVar(value=self.config_data.get("monitorDevice", r"\\.\DISPLAY1"))
-        ttk.Entry(self, textvariable=self.monitor_var, width=20).grid(row=row, column=1, columnspan=3, sticky="w")
-        row += 1
-        ttk.Label(self, text=r'Windows-style device name (e.g. \\.\DISPLAY1) - the game reports these itself in its logs.',
-                  foreground="gray").grid(row=row, column=0, columnspan=4, sticky="w")
+        ttk.Entry(basic, textvariable=self.fps_var, width=8).grid(row=row, column=1, sticky="w")
         row += 1
 
         self.gamescope_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self, text="Run inside gamescope (experimental - known to exit early on this game)",
+        ttk.Checkbutton(basic, text="Run inside gamescope (experimental - known to exit early on this game)",
                         variable=self.gamescope_var).grid(row=row, column=0, columnspan=4, sticky="w", pady=(16, 0))
         row += 1
         self.gamescope_fullscreen_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self, text="Fullscreen (gamescope only)",
+        ttk.Checkbutton(basic, text="Fullscreen (gamescope only)",
                         variable=self.gamescope_fullscreen_var).grid(row=row, column=0, columnspan=4, sticky="w")
+
+        # --- Advanced Graphics: fgo-launcher.json's own "graphics" object -
+        # already fully wired through fgo-launcher.sh into FGO_* env vars the
+        # injector reads (see GFX_*/FGO_HIDE_TARGET_LINES etc. there), just
+        # never had GUI controls. Choices/ranges match scooby's own
+        # MainWindow.xaml exactly.
+        g = self.graphics_data
+        row = 0
+        ttk.Label(advanced, text="Anti-aliasing:", width=18).grid(row=row, column=0, sticky="w", pady=3)
+        self.smaa_var = tk.StringVar(value=SMAA_VALUE_TO_NAME.get(g.get("smaa", 0), "Off (native)"))
+        ttk.Combobox(advanced, textvariable=self.smaa_var, values=[n for n, _ in SMAA_CHOICES],
+                     state="readonly", width=22).grid(row=row, column=1, sticky="w")
+        ttk.Label(advanced, text="Anisotropic filtering:").grid(row=row, column=2, sticky="w", padx=(16, 0))
+        self.anisotropy_var = tk.StringVar(value=ANISOTROPY_VALUE_TO_NAME.get(g.get("anisotropy", 16), "16x"))
+        ttk.Combobox(advanced, textvariable=self.anisotropy_var, values=[n for n, _ in ANISOTROPY_CHOICES],
+                     state="readonly", width=8).grid(row=row, column=3, sticky="w")
+        row += 1
+
+        ttk.Label(advanced, text="Render scale:", width=18).grid(row=row, column=0, sticky="w", pady=3)
+        self.render_scale_var = tk.StringVar(value=RENDER_SCALE_VALUE_TO_NAME.get(g.get("renderScale", 100), "100% (native)"))
+        ttk.Combobox(advanced, textvariable=self.render_scale_var, values=[n for n, _ in RENDER_SCALE_CHOICES],
+                     state="readonly", width=22).grid(row=row, column=1, sticky="w")
+        ttk.Label(advanced, text="Shadow resolution:").grid(row=row, column=2, sticky="w", padx=(16, 0))
+        self.shadow_res_var = tk.StringVar(value=SHADOW_RESOLUTION_VALUE_TO_NAME.get(g.get("shadowResolution", 0), "Game default"))
+        ttk.Combobox(advanced, textvariable=self.shadow_res_var, values=[n for n, _ in SHADOW_RESOLUTION_CHOICES],
+                     state="readonly", width=14).grid(row=row, column=3, sticky="w")
+        row += 1
+
+        self.motion_blur_var = tk.BooleanVar(value=bool(g.get("motionBlur", False)))
+        self.depth_of_field_var = tk.BooleanVar(value=bool(g.get("depthOfField", True)))
+        self.bloom_var = tk.BooleanVar(value=bool(g.get("bloom", True)))
+        self.no_camera_shake_var = tk.BooleanVar(value=bool(g.get("disableCameraShake", False)))
+        toggles = ttk.Frame(advanced)
+        toggles.grid(row=row, column=0, columnspan=4, sticky="w", pady=(10, 4))
+        ttk.Checkbutton(toggles, text="Motion Blur", variable=self.motion_blur_var).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(toggles, text="Depth of Field", variable=self.depth_of_field_var).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(toggles, text="Bloom", variable=self.bloom_var).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(toggles, text="No Camera Shake", variable=self.no_camera_shake_var).pack(side="left")
+        row += 1
+
+        self.hide_target_lines_var = tk.BooleanVar(value=bool(g.get("hideTargetLines", False)))
+        ttk.Checkbutton(advanced, text="Hide Enemy Lock-on Lines", variable=self.hide_target_lines_var).grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(4, 12))
+        row += 1
+
+        ttk.Separator(advanced, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=8)
+        row += 1
+        ttk.Label(advanced, text="Battle Damage Popups", font=("", 10, "bold")).grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        row += 1
+
+        def numeric_row(label, value, lo, hi):
+            nonlocal row
+            ttk.Label(advanced, text=label, width=18).grid(row=row, column=0, sticky="w", pady=3)
+            var = tk.StringVar(value=str(value))
+            ttk.Entry(advanced, textvariable=var, width=10).grid(row=row, column=1, sticky="w")
+            ttk.Label(advanced, text=f"({lo}-{hi}%)", foreground="gray").grid(row=row, column=2, sticky="w")
+            row += 1
+            return var
+
+        self.damage_number_scale_var = numeric_row("Damage number size:", g.get("damageNumberScale", 100), 0, 200)
+        self.damage_number_opacity_var = numeric_row("Number opacity:", g.get("damageNumberOpacity", 100), 0, 100)
+        self.damage_texture_scale_var = numeric_row("Popup graphic size:", g.get("damageTextureScale", 100), 0, 200)
+        self.damage_texture_opacity_var = numeric_row("Graphic opacity:", g.get("damageTextureOpacity", 100), 0, 100)
+
+        ttk.Separator(advanced, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=8)
+        row += 1
+
+        self.hide_ui_var = tk.BooleanVar(value=bool(g.get("hideUi", False)))
+        ttk.Checkbutton(advanced, text="Hide the UI When the Game Starts", variable=self.hide_ui_var).grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        row += 1
+        self.hide_cabinet_hud_var = tk.BooleanVar(value=bool(g.get("hideCabinetHud", False)))
+        ttk.Checkbutton(advanced, text="Hide the Cabinet HUD (GP, CREDIT, volume, status icons)",
+                        variable=self.hide_cabinet_hud_var).grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        row += 1
+
+        ttk.Label(advanced, text="Show/Hide UI shortcut:", width=20).grid(row=row, column=0, sticky="w", pady=3)
+        hide_ui_key_current = int(g.get("hideUiKey", 121))
+        self.hide_ui_key_var = tk.StringVar(value=KEY_VALUE_TO_NAME.get(hide_ui_key_current, f"0x{hide_ui_key_current:X}"))
+        key_names = [n for n, _ in KEY_CHOICES]
+        if self.hide_ui_key_var.get() not in key_names:
+            key_names = key_names + [self.hide_ui_key_var.get()]
+        ttk.Combobox(advanced, textvariable=self.hide_ui_key_var, values=key_names,
+                     state="readonly", width=18).grid(row=row, column=1, sticky="w")
 
     def validate(self):
         try:
@@ -517,17 +731,64 @@ class DisplayTab(ttk.Frame):
             raise ValueError("Resolution must be between 480 and 7680 on each side.")
         if not (1 <= fps <= 360):
             raise ValueError("Target FPS must be between 1 and 360.")
-        return width, height, fps
+
+        def pct(var, lo, hi, label):
+            try:
+                value = float(var.get())
+            except ValueError:
+                raise ValueError(f"{label} must be a number.")
+            if not (lo <= value <= hi):
+                raise ValueError(f"{label} must be between {lo} and {hi}.")
+            return value
+
+        damage = (
+            pct(self.damage_number_scale_var, 0, 200, "Damage number size"),
+            pct(self.damage_number_opacity_var, 0, 100, "Number opacity"),
+            pct(self.damage_texture_scale_var, 0, 200, "Popup graphic size"),
+            pct(self.damage_texture_opacity_var, 0, 100, "Graphic opacity"),
+        )
+        return width, height, fps, damage
 
     def save(self):
-        width, height, fps = self.validate()
+        width, height, fps, damage = self.validate()
+        damage_number_scale, damage_number_opacity, damage_texture_scale, damage_texture_opacity = damage
         self.config_data["resolutionWidth"] = width
         self.config_data["resolutionHeight"] = height
         self.config_data["targetFps"] = fps
         mode = self._mode_by_name[self.mode_display.get()]
         self.config_data["displayMode"] = mode
         self.config_data["windowed"] = mode != "exclusive"
-        self.config_data["monitorDevice"] = self.monitor_var.get()
+
+        smaa_name_to_value = {n: v for n, v in SMAA_CHOICES}
+        anisotropy_name_to_value = {n: v for n, v in ANISOTROPY_CHOICES}
+        render_scale_name_to_value = {n: v for n, v in RENDER_SCALE_CHOICES}
+        shadow_res_name_to_value = {n: v for n, v in SHADOW_RESOLUTION_CHOICES}
+        key_name_to_value = {n: v for n, v in KEY_CHOICES}
+
+        def resolve_key(name):
+            if name in key_name_to_value:
+                return key_name_to_value[name]
+            return int(name, 16)  # a "0x..." fallback label from an unrecognized existing value
+
+        self.graphics_data.update({
+            "smaa": smaa_name_to_value[self.smaa_var.get()],
+            "anisotropy": anisotropy_name_to_value[self.anisotropy_var.get()],
+            "renderScale": render_scale_name_to_value[self.render_scale_var.get()],
+            "shadowResolution": shadow_res_name_to_value[self.shadow_res_var.get()],
+            "motionBlur": self.motion_blur_var.get(),
+            "depthOfField": self.depth_of_field_var.get(),
+            "bloom": self.bloom_var.get(),
+            "disableCameraShake": self.no_camera_shake_var.get(),
+            "hideTargetLines": self.hide_target_lines_var.get(),
+            "damageNumberScale": damage_number_scale,
+            "damageNumberOpacity": damage_number_opacity,
+            "damageTextureScale": damage_texture_scale,
+            "damageTextureOpacity": damage_texture_opacity,
+            "hideUi": self.hide_ui_var.get(),
+            "hideCabinetHud": self.hide_cabinet_hud_var.get(),
+            "hideUiKey": resolve_key(self.hide_ui_key_var.get()),
+        })
+        self.config_data["graphics"] = self.graphics_data
         save_launcher_json(self.config_data)
 
     def play_env(self):
@@ -547,12 +808,30 @@ class ControlsTab(ttk.Frame):
         self.keyboard_vars = {}
         self.xinput_vars = {}
 
-        notebook = ttk.Notebook(self)
+        # [io4] mode is the actual switch the game reads to decide which
+        # scheme is live - scooby.exe writes this same key. Configuring the
+        # Controller (XInput) tab below does nothing at all in-game unless
+        # this is also set to "xinput" (the game defaults to "keyboard" if
+        # this key is missing, which is the ini's own out-of-the-box state).
+        mode_frame = ttk.Frame(self)
+        mode_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(mode_frame, text="Active input mode:").pack(side="left")
+        current_mode = get_ini_value(self.ini_text, "io4", "mode", "keyboard").strip().lower()
+        self.input_mode_var = tk.StringVar(value="Controller (XInput)" if current_mode == "xinput" else "Keyboard")
+        mode_combo = ttk.Combobox(mode_frame, textvariable=self.input_mode_var,
+                                   values=["Keyboard", "Controller (XInput)"], state="readonly", width=20)
+        mode_combo.pack(side="left", padx=(6, 10))
+        mode_combo.bind("<<ComboboxSelected>>", self._on_mode_changed)
+        ttk.Label(mode_frame, text="This is what actually switches which scheme the game listens to.",
+                  foreground="gray").pack(side="left")
+
+        self.notebook = notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True)
         kb_frame = ttk.Frame(notebook, padding=12)
         xi_frame = ttk.Frame(notebook, padding=12)
         notebook.add(kb_frame, text="Keyboard")
         notebook.add(xi_frame, text="Controller (XInput)")
+        notebook.select(1 if current_mode == "xinput" else 0)
 
         for row, (label, key, default) in enumerate(KEYBOARD_ACTIONS):
             current = int(get_ini_value(self.ini_text, "keyboard", key, hex(default)), 16)
@@ -569,6 +848,20 @@ class ControlsTab(ttk.Frame):
         self.controller_index_var = tk.StringVar(value=get_ini_value(self.ini_text, "xinput", "controllerIndex", "0"))
         ttk.Combobox(xi_frame, textvariable=self.controller_index_var, values=["0", "1", "2", "3"],
                      state="readonly", width=6).grid(row=row, column=1, sticky="w")
+        if HAVE_EVDEV:
+            ttk.Button(xi_frame, text="Vibrate to test", width=14,
+                       command=self._identify_controller).grid(row=row, column=2, sticky="w", padx=(6, 0))
+        row += 1
+        if HAVE_EVDEV:
+            self.identify_status_var = tk.StringVar(value="")
+            ttk.Label(xi_frame, textvariable=self.identify_status_var, foreground="gray", wraplength=440).grid(
+                row=row, column=0, columnspan=3, sticky="w")
+            row += 1
+        ttk.Label(xi_frame, text="Movement:", width=20).grid(row=row, column=0, sticky="w", pady=3)
+        movement_current = int(get_ini_value(self.ini_text, "xinput", "movement", "0") or 0)
+        self.movement_var = tk.StringVar(value=MOVEMENT_VALUE_TO_NAME.get(movement_current, "Left Stick"))
+        ttk.Combobox(xi_frame, textvariable=self.movement_var, values=[n for n, _ in MOVEMENT_CHOICES],
+                     state="readonly", width=14).grid(row=row, column=1, sticky="w")
         row += 1
         ttk.Label(xi_frame, text="Stick deadzone:", width=20).grid(row=row, column=0, sticky="w", pady=3)
         self.deadzone_var = tk.StringVar(value=get_ini_value(self.ini_text, "xinput", "stickDeadzone", "7849"))
@@ -607,11 +900,46 @@ class ControlsTab(ttk.Frame):
                            command=lambda v=var: self._capture(v)).grid(row=row, column=2, sticky="w", padx=(6, 0))
             row += 1
 
+    def _on_mode_changed(self, _event=None):
+        self.notebook.select(1 if self.input_mode_var.get().startswith("Controller") else 0)
+
     def _capture(self, var):
         dialog = CaptureDialog(self.winfo_toplevel())
         self.wait_window(dialog)
         if dialog.result is not None:
             var.set(XINPUT_VALUE_TO_NAME.get(dialog.result, f"0x{dialog.result:X}"))
+
+    def _identify_controller(self):
+        devices = _ff_devices()
+        try:
+            index = int(self.controller_index_var.get())
+        except ValueError:
+            index = 0
+        if not devices:
+            self.identify_status_var.set("No vibration-capable controller detected via evdev.")
+            return
+        if index >= len(devices):
+            self.identify_status_var.set(
+                f"Only {len(devices)} controller(s) with vibration support detected - "
+                f"controller number {index} isn't one of them.")
+            return
+        dev = devices[index]
+        try:
+            effect_id = _rumble_device(dev)
+        except OSError as exc:
+            self.identify_status_var.set(f"Could not vibrate {dev.name}: {exc}")
+            return
+        self.identify_status_var.set(
+            f"Vibrating: {dev.name} (slot {index} of {len(devices)} detected) - best-effort match only, "
+            f"Wine's own controller numbering may not match this order.")
+        self.after(700, lambda: self._cleanup_rumble(dev, effect_id))
+
+    @staticmethod
+    def _cleanup_rumble(dev, effect_id):
+        try:
+            dev.erase_effect(effect_id)
+        except OSError:
+            pass
 
     def validate(self):
         try:
@@ -646,6 +974,29 @@ class ControlsTab(ttk.Frame):
         text = set_ini_value(text, "xinput", "stickDeadzone", str(deadzone))
         text = set_ini_value(text, "xinput", "rumble", "1" if self.rumble_var.get() else "0")
         text = set_ini_value(text, "xinput", "rumbleStrength", str(rumble_strength))
+        movement_value = {n: v for n, v in MOVEMENT_CHOICES}[self.movement_var.get()]
+        text = set_ini_value(text, "xinput", "movement", str(movement_value))
+
+        # segatools.ini's own [io4] mode - matches scooby's own behavior
+        # (ControlSettingsView.cs writes this on every save). DualSense isn't
+        # offered by this GUI, so always leave it explicitly off.
+        #
+        # This alone does NOT control the real launch, though:
+        # fgo-launcher.sh copies this file into a *runtime* copy and then
+        # unconditionally overwrites [io4] mode again from fgo-launcher.json's
+        # own "inputMode" field (defaulting to "xinput" if that field is ever
+        # missing/invalid - see read_launcher_config.py and the `set_ini io4
+        # mode "$effective_input_mode"` line in fgo-launcher.sh). Writing both
+        # keeps segatools.ini correct for anything that reads it directly
+        # (e.g. scooby.exe) while actually taking effect for a real launch.
+        mode = "xinput" if self.input_mode_var.get().startswith("Controller") else "keyboard"
+        text = set_ini_value(text, "io4", "mode", mode)
+        text = set_ini_value(text, "dualsense", "enabled", "0")
+
+        launcher_config = load_launcher_json()
+        launcher_config["inputMode"] = mode
+        save_launcher_json(launcher_config)
+
         segatools_ini_path().write_text(text, encoding="utf-8")
         self.ini_text = text
 
@@ -1128,40 +1479,100 @@ class CardDetailDialog(tk.Toplevel):
 
 
 class DeckTab(ttk.Frame):
-    """Card grid is built entirely from live data: fgo_account.py's own
-    owned_cards for whichever account is currently in use, and thumbnail
-    images loaded from CardsPath (deck.json's own field, defaulting to
-    DEVICE/print/FGO11_AllServants) - nothing about specific cards/IDs is
-    hardcoded here, matching how scooby.exe itself works."""
+    """Mirrors scooby's own "Cards and Deck" > Deck page (MainWindow.xaml/.cs
+    in a scooby source checkout): Show/Sort/Owned-only filters, List/Icons
+    views, and Loadouts (save/load/delete/export/import), all reading and
+    writing the exact same files scooby.exe does. The one deliberate
+    difference: card selection is click-to-add + double-click for a
+    quantity/variant dialog rather than mouse drag-and-drop (Tkinter has no
+    native drag-and-drop, and this gets the same outcome without it) - deck
+    reordering isn't supported for the same reason (order isn't meaningful
+    to deck.json anyway).
+
+    The card catalog is NOT limited to what fgo_account.py's owned_cards
+    reports (that would leave "All Cards"/unowned browsing impossible) - it
+    starts from the game's own DEVICE/print/FGO11_AllServants/library-
+    manifest.json (load_card_catalog(), the same file fgo_account.py's own
+    load_card_manifest_by_id() reads), then overlays the account's real
+    owned counts on top. Cards sharing one internal ID (a character/CE's
+    different art variants) are grouped into one entity, same as scooby's
+    own CardStack.BuildEntities - nothing about specific cards/IDs is
+    hardcoded here."""
 
     PAGE_SIZE = 48
     THUMB_SIZE = (72, 111)
+    LIST_THUMB_SIZE = (56, 86)
+    MAX_DECK_SIZE = 30
 
     def __init__(self, parent):
         super().__init__(parent, padding=12)
         self.thumb_cache = {}  # file_name -> ImageTk.PhotoImage
-        self.owned_cards = []
-        self.filtered_cards = []
+        self.all_cards = {}  # tc_id -> card dict
+        self.entities = []  # [{"card": representative, "count": int, "variants": [card, ...]}]
+        self.filtered_entities = []
         self.page = 0
         self.selected = {}  # file_name -> {"card": card_dict, "qty": IntVar}
         self.cards_path = None
+        self._cards_path_override = None
+        self._click_after_id = None
+        self._game_version = ""
+        self._cache_queue = []
 
         if not HAVE_PIL:
             ttk.Label(self, text="Pillow (python3-Pillow) is required for the deck editor's card artwork - install it and restart.",
                       foreground="red", wraplength=500).pack(padx=8, pady=8)
             return
 
-        top = ttk.Frame(self)
-        top.pack(fill="x")
-        ttk.Label(top, text="Search:").pack(side="left")
+        self._card_type_name_to_value = {n: v for n, v in CARD_TYPE_CHOICES}
+        self._card_sort_name_to_value = {n: v for n, v in CARD_SORT_CHOICES}
+
+        path_row = ttk.Frame(self)
+        path_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(path_row, text="Card Folder:").pack(side="left")
+        self.cards_path_var = tk.StringVar()
+        ttk.Entry(path_row, textvariable=self.cards_path_var).pack(side="left", fill="x", expand=True, padx=(6, 6))
+        ttk.Button(path_row, text="Reload", command=self._reload_from_path).pack(side="left")
+
+        ttk.Label(self, text="Click a card to add it, or double-click one to pick its art and quantity.",
+                  foreground="gray").pack(anchor="w", pady=(0, 6))
+
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill="x")
+        ttk.Label(toolbar, text="Show").pack(side="left")
+        self.show_var = tk.StringVar(value="All Cards")
+        ttk.Combobox(toolbar, textvariable=self.show_var, values=[n for n, _ in CARD_TYPE_CHOICES],
+                     state="readonly", width=14).pack(side="left", padx=(4, 12))
+        self.show_var.trace_add("write", lambda *_: self._apply_filter())
+        ttk.Label(toolbar, text="Sort").pack(side="left")
+        self.sort_var = tk.StringVar(value="Folder order")
+        ttk.Combobox(toolbar, textvariable=self.sort_var, values=[n for n, _ in CARD_SORT_CHOICES],
+                     state="readonly", width=12).pack(side="left", padx=(4, 12))
+        self.sort_var.trace_add("write", lambda *_: self._apply_filter())
+        self.owned_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="Owned cards only", variable=self.owned_only_var,
+                        command=self._apply_filter).pack(side="left", padx=(0, 16))
+        self._cache_button = ttk.Button(toolbar, text="Cache Thumbnails", command=self._build_thumbnail_cache)
+        self._cache_button.pack(side="left")
+        ttk.Label(toolbar, text="View").pack(side="left", padx=(16, 4))
+        self.view_mode = tk.StringVar(value="Icons")
+        ttk.Radiobutton(toolbar, text="List", value="List", variable=self.view_mode, style="Toolbutton",
+                         command=self._on_view_mode_changed).pack(side="left")
+        ttk.Radiobutton(toolbar, text="Icons", value="Icons", variable=self.view_mode, style="Toolbutton",
+                         command=self._on_view_mode_changed).pack(side="left")
+
+        self.summary_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.summary_var, foreground="gray", wraplength=780).pack(anchor="w", pady=(6, 4))
+
+        search_row = ttk.Frame(self)
+        search_row.pack(fill="x")
+        ttk.Label(search_row, text="Search:").pack(side="left")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._apply_filter())
-        ttk.Entry(top, textvariable=self.search_var, width=30).pack(side="left", padx=(4, 12))
-        ttk.Button(top, text="Reload from account", command=self.reload).pack(side="left")
+        ttk.Entry(search_row, textvariable=self.search_var, width=30).pack(side="left", padx=(4, 12))
         self.page_label_var = tk.StringVar(value="")
-        ttk.Label(top, textvariable=self.page_label_var).pack(side="left", padx=(12, 0))
-        ttk.Button(top, text="< Prev", command=self._prev_page).pack(side="left", padx=(12, 0))
-        ttk.Button(top, text="Next >", command=self._next_page).pack(side="left", padx=(4, 0))
+        ttk.Label(search_row, textvariable=self.page_label_var).pack(side="left", padx=(12, 0))
+        ttk.Button(search_row, text="< Prev", command=self._prev_page).pack(side="left", padx=(12, 0))
+        ttk.Button(search_row, text="Next >", command=self._next_page).pack(side="left", padx=(4, 0))
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, pady=(8, 0))
@@ -1177,20 +1588,45 @@ class DeckTab(ttk.Frame):
         self.grid_canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
         self.grid_frame.bind("<Configure>", lambda e: self.grid_canvas.configure(scrollregion=self.grid_canvas.bbox("all")))
 
-        side = ttk.Frame(body, width=220)
+        side = ttk.Frame(body, width=240)
         side.pack(side="left", fill="y", padx=(10, 0))
+        self.deck_status_var = tk.StringVar(value="0 of 30 cards")
+        ttk.Label(side, textvariable=self.deck_status_var, font=("", 10, "bold")).pack(anchor="w")
+        ttk.Button(side, text="Clear Deck", command=self._clear_deck).pack(fill="x", pady=(2, 8))
         ttk.Label(side, text="Selected deck:").pack(anchor="w")
-        self.selected_list = tk.Listbox(side, width=32, height=22)
-        self.selected_list.pack(fill="y", expand=False)
+        self.selected_list = tk.Listbox(side, width=32, height=14)
+        self.selected_list.pack(fill="both", expand=True)
         ttk.Button(side, text="Remove selected", command=self._remove_from_deck_list).pack(fill="x", pady=(4, 0))
-        ttk.Button(side, text="Save Deck", command=self.save).pack(fill="x", pady=(8, 0))
+        ttk.Button(side, text="Save Deck", command=self.save).pack(fill="x", pady=(4, 0))
+
+        ttk.Separator(side, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Label(side, text="Loadouts:").pack(anchor="w")
+        self.loadout_var = tk.StringVar()
+        self.loadout_combo = ttk.Combobox(side, textvariable=self.loadout_var, state="readonly", width=28)
+        self.loadout_combo.pack(fill="x", pady=(2, 4))
+        loadout_row1 = ttk.Frame(side)
+        loadout_row1.pack(fill="x")
+        ttk.Button(loadout_row1, text="Save as", command=self._loadout_save).pack(side="left", expand=True, fill="x")
+        ttk.Button(loadout_row1, text="Load", command=self._loadout_load).pack(side="left", expand=True, fill="x")
+        ttk.Button(loadout_row1, text="Delete", command=self._loadout_delete).pack(side="left", expand=True, fill="x")
+        loadout_row2 = ttk.Frame(side)
+        loadout_row2.pack(fill="x", pady=(2, 0))
+        ttk.Button(loadout_row2, text="Export", command=self._loadout_export).pack(side="left", expand=True, fill="x")
+        ttk.Button(loadout_row2, text="Import", command=self._loadout_import).pack(side="left", expand=True, fill="x")
+        open_folder_link = ttk.Label(side, text="Open folder", foreground="#3d8fd6", cursor="hand2")
+        open_folder_link.pack(anchor="w", pady=(6, 0))
+        open_folder_link.bind("<Button-1>", lambda e: self._loadout_open_folder())
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=700).pack(anchor="w", pady=(6, 0))
+        ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=780).pack(anchor="w", pady=(6, 0))
 
         self.reload()
 
+    # --- loading / filtering -------------------------------------------------
+
     def _resolve_cards_path(self):
+        if self._cards_path_override is not None:
+            return self._cards_path_override
         try:
             deck = json.loads(deck_json_path().read_text(encoding="utf-8"))
             raw = deck.get("CardsPath") or ""
@@ -1199,6 +1635,12 @@ class DeckTab(ttk.Frame):
         if not raw:
             raw = "../DEVICE/print/FGO11_AllServants"
         return (install_root() / "App" / raw.replace("\\", "/")).resolve()
+
+    def _reload_from_path(self):
+        text = self.cards_path_var.get().strip()
+        self._cards_path_override = Path(text).expanduser() if text else None
+        self.thumb_cache.clear()
+        self.reload()
 
     def reload(self):
         self.status_var.set("Loading account data...")
@@ -1211,19 +1653,33 @@ class DeckTab(ttk.Frame):
         current = next((a for a in data.get("accounts", []) if a.get("is_current")), None)
         if current is None and data.get("accounts"):
             current = data["accounts"][0]
-        if current is None:
-            self.status_var.set("No account found - create one in the Account tab first.")
-            self.owned_cards = []
-        else:
-            self.owned_cards = current.get("owned_cards", [])
+        owned_cards = current.get("owned_cards", []) if current else []
         self.cards_path = self._resolve_cards_path()
+        self.cards_path_var.set(str(self.cards_path))
+
+        catalog = load_card_catalog()
+        for card in owned_cards:
+            catalog[card["tc_id"]] = card  # real owned data wins over the zero-count placeholder
+        self.all_cards = catalog
+
+        groups = {}
+        for card in self.all_cards.values():
+            key = TRANSLATIONS.internal_id(card)
+            if not key:
+                continue
+            groups.setdefault(key, []).append(card)
+        entities = []
+        for variants in groups.values():
+            variants.sort(key=lambda c: c["tc_id"])
+            entities.append({"card": variants[0], "count": sum(v["count"] for v in variants), "variants": variants})
+        self.entities = entities
 
         self.selected.clear()
         try:
             deck = json.loads(deck_json_path().read_text(encoding="utf-8"))
             selected_paths = deck.get("SelectedCards") or []
             selected_copies = deck.get("SelectedCardCopies") or []
-            by_file = {c["file_name"]: c for c in self.owned_cards}
+            by_file = {c["file_name"]: c for c in self.all_cards.values()}
             for path, qty in zip(selected_paths, selected_copies):
                 file_name = Path(path.replace("\\", "/")).name
                 card = by_file.get(file_name)
@@ -1232,61 +1688,179 @@ class DeckTab(ttk.Frame):
         except (OSError, json.JSONDecodeError):
             pass
 
-        self.page = 0
+        self._game_version = load_launcher_json().get("gameVersion", "")
+        self._refresh_loadouts()
         self._apply_filter()
         self._refresh_selected_list()
         who = current["master_name"] if current else "no account"
-        self.status_var.set(f"{len(self.owned_cards)} owned card(s) for {who}. Cards read from {self.cards_path}.")
+        self.status_var.set(f"Cards for {who}. Cards read from {self.cards_path}.")
 
     def _apply_filter(self):
+        if not self.entities and not hasattr(self, "summary_var"):
+            return  # HAVE_PIL was False - no widgets were built at all
+        show_type = self._card_type_name_to_value.get(self.show_var.get(), 0)
+        owned_only = self.owned_only_var.get()
         query = self.search_var.get().strip().lower()
-        if query:
-            self.filtered_cards = [c for c in self.owned_cards
-                                    if query in c["display_name"].lower() or query in c["file_name"].lower()]
-        else:
-            self.filtered_cards = list(self.owned_cards)
+
+        def matches(entity):
+            card = entity["card"]
+            if show_type and card["card_type_id"] != show_type:
+                return False
+            if owned_only and entity["count"] <= 0:
+                return False
+            if not query:
+                return True
+            name = self._display_name(card).lower()
+            japanese = (TRANSLATIONS.japanese_name(card) or "").lower()
+            internal_id = (TRANSLATIONS.internal_id(card) or "").lower()
+            if query in name or query in japanese or query in internal_id:
+                return True
+            return any(query in v["file_name"].lower() or query in str(v["tc_id"]) for v in entity["variants"])
+
+        filtered = [e for e in self.entities if matches(e)]
+        sort_mode = self._card_sort_name_to_value.get(self.sort_var.get(), 0)
+        if sort_mode == 1:  # Name
+            filtered.sort(key=lambda e: self._display_name(e["card"]).lower())
+        elif sort_mode == 2:  # Card number
+            filtered.sort(key=lambda e: e["card"]["tc_id"])
+        # sort_mode == 0 (Folder order): keep self.entities' own build order
+
+        self.filtered_entities = filtered
         self.page = 0
-        self._render_page()
+        self._render_current_page()
+        self._update_summary()
+
+    def _update_summary(self):
+        servant_total = sum(1 for e in self.entities if e["card"]["card_type_id"] == 1)
+        ce_total = sum(1 for e in self.entities if e["card"]["card_type_id"] == 2)
+        show_type = self._card_type_name_to_value.get(self.show_var.get(), 0)
+        if show_type == 1:
+            label = f"Servants {servant_total:,}"
+        elif show_type == 2:
+            label = f"Craft Essences {ce_total:,}"
+        else:
+            label = f"Servants {servant_total:,} / Craft Essences {ce_total:,}"
+        shown = len(self.filtered_entities)
+        self.summary_var.set(f"{label} - {shown:,} shown")
+        if not self.all_cards:
+            self.summary_var.set(f"No card images in {self.cards_path}. They come with the full package "
+                                  "(DEVICE/print/FGO11_AllServants), not with any update - extract that "
+                                  "package into the game folder again, then click Reload.")
 
     def _prev_page(self):
         if self.page > 0:
             self.page -= 1
-            self._render_page()
+            self._render_current_page()
 
     def _next_page(self):
-        if (self.page + 1) * self.PAGE_SIZE < len(self.filtered_cards):
+        if (self.page + 1) * self.PAGE_SIZE < len(self.filtered_entities):
             self.page += 1
-            self._render_page()
+            self._render_current_page()
 
-    def _thumbnail(self, card):
+    def _on_view_mode_changed(self):
+        self.page = 0
+        self._render_current_page()
+
+    # --- thumbnails ------------------------------------------------------
+
+    def _thumbnail_cache_dir(self):
+        return install_root() / "DEVICE" / "cache" / "card-thumbnails"
+
+    def _cached_thumbnail_path(self, file_name):
+        return self._thumbnail_cache_dir() / (Path(file_name).stem + ".jpg")
+
+    def _thumbnail(self, card, size=None):
         file_name = card["file_name"]
-        if file_name in self.thumb_cache:
-            return self.thumb_cache[file_name]
-        path = self.cards_path / file_name
+        if not file_name:
+            return None
+        cache_key = (file_name, size or self.THUMB_SIZE)
+        if cache_key in self.thumb_cache:
+            return self.thumb_cache[cache_key]
+        source = self.cards_path / file_name
+        cached = self._cached_thumbnail_path(file_name)
+        photo = None
         try:
-            image = Image.open(path)
-            image.thumbnail(self.THUMB_SIZE)
+            use_cache = cached.is_file() and cached.stat().st_mtime >= source.stat().st_mtime
+            image = Image.open(cached if use_cache else source)
+            image.thumbnail(size or self.THUMB_SIZE)
             photo = ImageTk.PhotoImage(image)
         except (OSError, ValueError):
             photo = None
-        self.thumb_cache[file_name] = photo
+        self.thumb_cache[cache_key] = photo
         return photo
+
+    def _build_thumbnail_cache(self):
+        files = sorted({c["file_name"] for c in self.all_cards.values() if c["file_name"]})
+        if not files:
+            return
+        self._cache_queue = files
+        self._cache_total = len(files)
+        self._cache_done = 0
+        self._cache_created = 0
+        self._cache_failed = 0
+        self._cache_button.state(["disabled"])
+        self._cache_thumbnail_step()
+
+    def _cache_thumbnail_step(self):
+        chunk = 25
+        cache_dir = self._thumbnail_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        for _ in range(chunk):
+            if not self._cache_queue:
+                break
+            file_name = self._cache_queue.pop(0)
+            self._cache_done += 1
+            source = self.cards_path / file_name
+            target = self._cached_thumbnail_path(file_name)
+            try:
+                if not (target.is_file() and target.stat().st_mtime >= source.stat().st_mtime):
+                    image = Image.open(source)
+                    image.thumbnail((160, 224))
+                    image.convert("RGB").save(target, "JPEG", quality=84)
+                    self._cache_created += 1
+            except (OSError, ValueError):
+                self._cache_failed += 1
+        self._cache_button.configure(text=f"Caching {self._cache_done:,}/{self._cache_total:,}")
+        if self._cache_queue:
+            self.after(1, self._cache_thumbnail_step)
+        else:
+            label = (f"Cached +{self._cache_created:,}" if self._cache_failed == 0
+                      else f"Done +{self._cache_created:,} / failed {self._cache_failed:,}")
+            self._cache_button.configure(text=label)
+            self._cache_button.state(["!disabled"])
+            self.thumb_cache.clear()
+            self._render_current_page()
 
     @staticmethod
     def _display_name(card):
         return TRANSLATIONS.english_name(card) or card["display_name"]
 
-    def _render_page(self):
+    # --- rendering ---------------------------------------------------------
+
+    def _render_current_page(self):
         for child in self.grid_frame.winfo_children():
             child.destroy()
         start = self.page * self.PAGE_SIZE
-        page_cards = self.filtered_cards[start:start + self.PAGE_SIZE]
+        page_entities = self.filtered_entities[start:start + self.PAGE_SIZE]
+        if self.view_mode.get() == "List":
+            self._render_list(page_entities)
+        else:
+            self._render_icons(page_entities)
+        total_pages = max(1, (len(self.filtered_entities) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page_label_var.set(f"Page {self.page + 1}/{total_pages}")
+
+    def _is_entity_selected(self, entity):
+        return any(v["file_name"] in self.selected for v in entity["variants"])
+
+    def _render_icons(self, entities):
         columns = 6
-        for index, card in enumerate(page_cards):
+        for index, entity in enumerate(entities):
+            card = entity["card"]
             r, c = divmod(index, columns)
+            is_selected = self._is_entity_selected(entity)
             cell = ttk.Frame(self.grid_frame, padding=4,
-                              relief="solid" if card["file_name"] in self.selected else "flat",
-                              borderwidth=2 if card["file_name"] in self.selected else 0)
+                              relief="solid" if is_selected else "flat",
+                              borderwidth=2 if is_selected else 0)
             cell.grid(row=r, column=c, padx=3, pady=3)
             photo = self._thumbnail(card)
             if photo is not None:
@@ -1298,34 +1872,94 @@ class DeckTab(ttk.Frame):
             name_label = ttk.Label(cell, text=self._display_name(card)[:22], width=16, wraplength=110)
             name_label.pack()
             for widget in (cell, label, name_label):
-                widget.bind("<Button-1>", lambda e, c=card: self._toggle_card(c))
-                widget.bind("<Double-Button-1>", lambda e, c=card: self._open_detail(c))
-        total_pages = max(1, (len(self.filtered_cards) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
-        self.page_label_var.set(f"Page {self.page + 1}/{total_pages} ({len(self.filtered_cards)} matching)")
+                widget.bind("<Button-1>", lambda e, en=entity: self._on_click(en))
+                widget.bind("<Double-Button-1>", lambda e, en=entity: self._on_double_click(en))
 
-    def _toggle_card(self, card):
-        file_name = card["file_name"]
-        if file_name in self.selected:
-            del self.selected[file_name]
+    def _render_list(self, entities):
+        for entity in entities:
+            card = entity["card"]
+            is_selected = self._is_entity_selected(entity)
+            row = ttk.Frame(self.grid_frame, padding=6,
+                              relief="solid" if is_selected else "flat",
+                              borderwidth=1 if is_selected else 0)
+            row.pack(fill="x", pady=1)
+            row.grid_columnconfigure(1, weight=1)
+            photo = self._thumbnail(card, self.LIST_THUMB_SIZE)
+            if photo is not None:
+                thumb_label = tk.Label(row, image=photo, cursor="hand2")
+                thumb_label.image = photo
+            else:
+                thumb_label = tk.Label(row, text="(no image)", width=9, height=5, cursor="hand2")
+            thumb_label.grid(row=0, column=0, rowspan=3, padx=(0, 12))
+            name = self._display_name(card)
+            japanese = TRANSLATIONS.japanese_name(card)
+            internal_id = TRANSLATIONS.internal_id(card) or "?"
+            ttk.Label(row, text=name, font=("", 11, "bold")).grid(row=0, column=1, sticky="w")
+            ttk.Label(row, text=japanese or "", foreground="gray").grid(row=1, column=1, sticky="w")
+            ttk.Label(row, text=f"Internal ID {internal_id}", foreground="gray").grid(row=2, column=1, sticky="w")
+            type_label = "Servant" if card["card_type_id"] == 1 else "Craft Essence"
+            ttk.Label(row, text=f"{type_label} x{entity['count']}", font=("", 9, "bold")).grid(
+                row=0, column=2, sticky="e", padx=(16, 0))
+            ttk.Label(row, text=f"TC ID {card['tc_id']}", foreground="gray").grid(
+                row=1, column=2, sticky="e", padx=(16, 0))
+            for widget in (row, thumb_label):
+                widget.bind("<Button-1>", lambda e, en=entity: self._on_click(en))
+                widget.bind("<Double-Button-1>", lambda e, en=entity: self._on_double_click(en))
+
+    # --- selection -----------------------------------------------------------
+
+    def _on_click(self, entity):
+        # A single click toggles selection, which rebuilds the whole page
+        # (_render_current_page destroys every cell/row widget) - doing that
+        # immediately would destroy the widget mid double-click, before Tk
+        # ever gets to recognize the second click as one, so
+        # <Double-Button-1> would never fire. Defer the toggle instead, and
+        # let a real double-click (which cancels it) take over.
+        if self._click_after_id is not None:
+            self.after_cancel(self._click_after_id)
+        self._click_after_id = self.after(250, lambda: self._commit_click(entity))
+
+    def _on_double_click(self, entity):
+        if self._click_after_id is not None:
+            self.after_cancel(self._click_after_id)
+            self._click_after_id = None
+        self._open_detail(entity)
+
+    def _commit_click(self, entity):
+        self._click_after_id = None
+        self._toggle_entity(entity)
+
+    def _toggle_entity(self, entity):
+        # Any selected variant counts as "this entity is in the deck" - a
+        # plain click toggles the representative (lowest TC ID) variant off
+        # entirely, or on at quantity 1; double-click (the full dialog) picks
+        # a different variant or sets quantities per variant.
+        if self._is_entity_selected(entity):
+            for variant in entity["variants"]:
+                self.selected.pop(variant["file_name"], None)
         else:
-            self.selected[file_name] = {"card": card, "qty": tk.IntVar(value=1)}
-        self._render_page()
+            if sum(e["qty"].get() for e in self.selected.values()) >= self.MAX_DECK_SIZE:
+                self.status_var.set(f"Deck is full ({self.MAX_DECK_SIZE} cards) - remove something first.")
+                return
+            file_name = entity["card"]["file_name"]
+            self.selected[file_name] = {"card": entity["card"], "qty": tk.IntVar(value=1)}
+        self._render_current_page()
         self._refresh_selected_list()
 
-    def _open_detail(self, card):
-        internal_id = TRANSLATIONS.internal_id(card)
-        variants = [c for c in self.owned_cards
-                    if TRANSLATIONS.internal_id(c) == internal_id] if internal_id else [card]
-        dialog = CardDetailDialog(self.winfo_toplevel(), card, variants, self.selected, self._thumbnail)
+    def _open_detail(self, entity):
+        dialog = CardDetailDialog(self.winfo_toplevel(), entity["card"], entity["variants"], self.selected, self._thumbnail)
         self.wait_window(dialog)
         if dialog.changed:
-            self._render_page()
+            self._render_current_page()
             self._refresh_selected_list()
 
     def _refresh_selected_list(self):
         self.selected_list.delete(0, "end")
-        for file_name, entry in self.selected.items():
+        for entry in self.selected.values():
             self.selected_list.insert("end", f"{entry['qty'].get()}x {self._display_name(entry['card'])[:28]}")
+        total = sum(entry["qty"].get() for entry in self.selected.values())
+        suffix = f" - FGO {self._game_version}" if self._game_version else ""
+        self.deck_status_var.set(f"{total} of {self.MAX_DECK_SIZE} cards{suffix}")
 
     def _remove_from_deck_list(self):
         selection = self.selected_list.curselection()
@@ -1333,7 +1967,16 @@ class DeckTab(ttk.Frame):
             return
         file_name = list(self.selected.keys())[selection[0]]
         del self.selected[file_name]
-        self._render_page()
+        self._render_current_page()
+        self._refresh_selected_list()
+
+    def _clear_deck(self):
+        if not self.selected:
+            return
+        if not messagebox.askyesno("Clear Deck", "Remove all cards from the deck?"):
+            return
+        self.selected.clear()
+        self._render_current_page()
         self._refresh_selected_list()
 
     def save(self):
@@ -1349,6 +1992,153 @@ class DeckTab(ttk.Frame):
             "CardsPath": relative_cards_path,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         self.status_var.set(f"Saved {len(selected_cards)} card(s) to deck.json.")
+
+    # --- loadouts (App/deck-loadouts/<name>.json) ---------------------------
+    # Format matches scooby's own exactly ("fgoac-loadout" v1, file+copy
+    # pairs, no paths) so loadouts saved by either tool load in the other.
+
+    def _refresh_loadouts(self, select=None):
+        folder = loadout_folder()
+        names = sorted(p.stem for p in folder.glob("*.json")) if folder.is_dir() else []
+        self.loadout_combo["values"] = names
+        if select is not None and select in names:
+            self.loadout_var.set(select)
+        elif self.loadout_var.get() not in names:
+            self.loadout_var.set("")
+
+    def _loadout_save(self):
+        if not self.selected:
+            self.status_var.set("The deck is empty - nothing to save.")
+            return
+        name = simpledialog.askstring("Save loadout", "Name for this deck:",
+                                       initialvalue=self.loadout_var.get(), parent=self.winfo_toplevel())
+        if not name:
+            return
+        folder = loadout_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"{name}.json"
+        if target.exists() and not messagebox.askyesno("Save loadout", f'Replace the loadout "{name}"?'):
+            return
+        cards = [{"file": entry["card"]["file_name"], "copy": entry["qty"].get()} for entry in self.selected.values()]
+        payload = {"format": "fgoac-loadout", "version": 1, "name": name, "cards": cards}
+        try:
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.status_var.set(f"The loadout could not be saved: {exc}")
+            return
+        self._refresh_loadouts(select=name)
+        self.status_var.set(f"Loadout saved: {name}. Export sends a copy to share.")
+
+    @staticmethod
+    def _looks_like_loadout(data):
+        return isinstance(data, dict) and data.get("format") == "fgoac-loadout" and isinstance(data.get("cards"), list)
+
+    def _apply_loadout_file(self, path):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.status_var.set("That file is not a deck loadout.")
+            return
+        if not self._looks_like_loadout(data):
+            self.status_var.set("That file is not a deck loadout.")
+            return
+        by_file = {c["file_name"]: c for c in self.all_cards.values()}
+        new_selection = {}
+        missing = 0
+        for entry in data["cards"]:
+            # basename only, same as scooby - a shared file cannot point outside the card folder
+            file_name = Path(str(entry.get("file", ""))).name
+            if not file_name:
+                continue
+            card = by_file.get(file_name)
+            if not card:
+                missing += 1
+                continue
+            try:
+                qty = max(1, min(self.MAX_DECK_SIZE, int(entry.get("copy", 1))))
+            except (TypeError, ValueError):
+                qty = 1
+            new_selection[file_name] = {"card": card, "qty": tk.IntVar(value=qty)}
+        if not new_selection:
+            self.status_var.set("None of that loadout's cards are in your card folder." if missing
+                                 else "That loadout holds no cards.")
+            return
+        self.selected = new_selection
+        self._render_current_page()
+        self._refresh_selected_list()
+        name = data.get("name") or path.stem
+        suffix = (f"; {missing} not in your card folder were left out." if missing > 1
+                  else "; 1 not in your card folder was left out." if missing == 1 else ".")
+        self.status_var.set(f"Loadout loaded: {name} - {len(new_selection)} cards{suffix}")
+
+    def _loadout_load(self):
+        name = self.loadout_var.get()
+        if not name:
+            return
+        self._apply_loadout_file(loadout_folder() / f"{name}.json")
+
+    def _loadout_delete(self):
+        name = self.loadout_var.get()
+        if not name:
+            return
+        if not messagebox.askyesno("Delete loadout", f'Delete the loadout "{name}"?'):
+            return
+        (loadout_folder() / f"{name}.json").unlink(missing_ok=True)
+        self._refresh_loadouts()
+        self.status_var.set(f"Loadout deleted: {name}")
+
+    def _loadout_export(self):
+        name = self.loadout_var.get()
+        if not name:
+            self.status_var.set("Select a loadout to export, or Save as first.")
+            return
+        source = loadout_folder() / f"{name}.json"
+        desktop = Path.home() / "Desktop"
+        dest = filedialog.asksaveasfilename(
+            title="Export loadout", initialfile=f"{name}.json", defaultextension=".json",
+            initialdir=str(desktop if desktop.is_dir() else Path.home()), filetypes=[("Deck loadout", "*.json")])
+        if not dest:
+            return
+        try:
+            shutil.copyfile(source, dest)
+        except OSError as exc:
+            self.status_var.set(f"The loadout could not be exported: {exc}")
+            return
+        self.status_var.set(f"Exported: {Path(dest).name} - send it to anyone with the launcher; they add it with Import.")
+
+    def _loadout_import(self):
+        source = filedialog.askopenfilename(title="Import loadout", filetypes=[("Deck loadout", "*.json")])
+        if not source:
+            return
+        try:
+            data = json.loads(Path(source).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            messagebox.showerror("Import", "That file is not a deck loadout. Pick a .json file that was "
+                                            "exported from the Loadouts row.")
+            return
+        if not self._looks_like_loadout(data):
+            messagebox.showerror("Import", "That file is not a deck loadout. Pick a .json file that was "
+                                            "exported from the Loadouts row.")
+            return
+        name = data.get("name") or Path(source).stem
+        folder = loadout_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"{name}.json"
+        try:
+            shutil.copyfile(source, target)
+        except OSError as exc:
+            self.status_var.set(f"The loadout could not be imported: {exc}")
+            return
+        self._refresh_loadouts(select=name)
+        self._apply_loadout_file(target)
+
+    def _loadout_open_folder(self):
+        folder = loadout_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.Popen(["xdg-open", str(folder)])
+        except OSError:
+            messagebox.showinfo("Open folder", str(folder))
 
 
 class App(tk.Tk):
@@ -1427,9 +2217,61 @@ class App(tk.Tk):
         env.update(self.display_tab.play_env())
         try:
             subprocess.Popen([str(linux_dir / "fgo-launcher.sh")], env=env)
-            self.status_var.set("Launching...")
         except Exception as exc:
             messagebox.showerror("Could not launch", str(exc))
+            return
+        self.status_var.set("Launching...")
+        self._shader_cache_dir = self._find_shader_cache_dir()
+        self._shader_baseline = self._count_shader_files(self._shader_cache_dir)
+        self._shader_last_count = self._shader_baseline
+        self._shader_stable_ticks = 0
+        self._shader_poll_ticks = 0
+        self._poll_shader_progress()
+
+    @staticmethod
+    def _find_shader_cache_dir():
+        # App/shader-cache-rN/ - the numeric suffix is tied to the game
+        # version, so don't hardcode it. See fgo-launcher.sh's own comment on
+        # this same directory for why it exists (persisted outside the
+        # install via a symlink, to skip a cold shader recompile on a fresh
+        # install).
+        try:
+            candidates = sorted(install_root().glob("App/shader-cache-r*"))
+        except OSError:
+            return None
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _count_shader_files(path):
+        if path is None or not path.is_dir():
+            return 0
+        try:
+            return sum(1 for entry in path.iterdir() if entry.is_file())
+        except OSError:
+            return 0
+
+    def _poll_shader_progress(self):
+        count = self._count_shader_files(self._shader_cache_dir)
+        if self._shader_cache_dir is None:
+            # The dir doesn't exist yet at all (very first launch ever, or
+            # the symlink hasn't been recreated yet) - keep looking for it.
+            self._shader_cache_dir = self._find_shader_cache_dir()
+        new = count - self._shader_baseline
+        self._shader_stable_ticks = self._shader_stable_ticks + 1 if count == self._shader_last_count else 0
+        self._shader_last_count = count
+        self._shader_poll_ticks += 1
+        if new > 0:
+            self.status_var.set(f"Launching - compiling shaders: {count} cached ({new} new this run)...")
+        else:
+            self.status_var.set(f"Launching... ({count} shaders already cached)")
+        # Stop once the count's held steady for a few seconds (compile looks
+        # done) or after a generous cap, so this doesn't poll forever if the
+        # count never settles for some reason.
+        if self._shader_stable_ticks >= 4 or self._shader_poll_ticks >= 180:
+            suffix = f" ({new} new this run)" if new > 0 else ""
+            self.status_var.set(f"Launched. {count} shaders cached{suffix}.")
+            return
+        self.after(1000, self._poll_shader_progress)
 
 
 def main():
