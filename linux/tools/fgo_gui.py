@@ -21,6 +21,7 @@ placeholder until a valid install root is set.
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -190,6 +191,39 @@ def install_root():
     if root is None:
         raise SystemExit("FGO_INSTALL_ROOT is not set to a valid install - configure it in the Setup tab first.")
     return root
+
+
+def terminal_command(command):
+    """argv that runs `command` in a new terminal window, or None if none found.
+    Order: xdg-terminal-exec, $TERMINAL, KDE's configured terminal, common ones."""
+    if shutil.which("xdg-terminal-exec"):
+        return ["xdg-terminal-exec", *command]
+    candidates = []
+    if os.environ.get("TERMINAL"):
+        candidates.append(shlex.split(os.environ["TERMINAL"]))
+    for tool in ("kreadconfig6", "kreadconfig5"):
+        if shutil.which(tool):
+            result = subprocess.run([tool, "--group", "General", "--key", "TerminalApplication"],
+                                    capture_output=True, text=True, timeout=5)
+            if result.stdout.strip():
+                candidates.append(shlex.split(result.stdout.strip()))
+            break
+    candidates += [[name] for name in ("konsole", "wezterm", "kitty", "alacritty", "gnome-terminal",
+                                       "foot", "xfce4-terminal", "xterm")]
+    for base in candidates:
+        if not base or not shutil.which(base[0]):
+            continue
+        name = Path(base[0]).name
+        if name == "wezterm":
+            return [*(base if "start" in base else [base[0], "start"]), "--", *command]
+        if name == "gnome-terminal":
+            return [*base, "--", *command]
+        if name == "xfce4-terminal":
+            return [*base, "-x", *command]
+        if name in ("kitty", "foot"):
+            return [*base, *command]
+        return [*base, "-e", *command]  # konsole, alacritty, xterm and most others
+    return None
 
 
 # --- Wine/Proton build discovery, for the Setup tab's dropdown ---
@@ -3252,6 +3286,10 @@ class App(tk.Tk):
         button_row.pack(side="bottom", fill="x")
         ttk.Button(button_row, text="Save", command=self.on_save).pack(side="left")
         ttk.Button(button_row, text="Save && Play", command=self.on_play).pack(side="left", padx=(8, 0))
+        self.log_terminal_var = tk.BooleanVar(
+            value=get_env_value(read_env_file(), "FGO_GUI_LOG_TERMINAL") == "1")
+        ttk.Checkbutton(button_row, text="Live log in a terminal", variable=self.log_terminal_var,
+                        command=self._on_log_terminal_toggled).pack(side="left", padx=(12, 0))
         self.status_var = tk.StringVar(value="")
         ttk.Label(button_row, textvariable=self.status_var, foreground="gray").pack(side="left", padx=(16, 0))
 
@@ -3292,6 +3330,11 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Could not save", str(exc))
 
+    def _on_log_terminal_toggled(self):
+        # A GUI preference, saved immediately; never creates fgo.env on its own.
+        if env_file_path().exists():
+            set_env_values({"FGO_GUI_LOG_TERMINAL": "1" if self.log_terminal_var.get() else "0"})
+
     def on_play(self):
         if self.display_tab is None:
             messagebox.showerror("Not configured", "Configure and save the Setup tab, then restart, before playing.")
@@ -3302,12 +3345,28 @@ class App(tk.Tk):
             messagebox.showerror("Could not save", str(exc))
             return
         linux_dir = Path(__file__).resolve().parent.parent  # linux/tools -> linux
+        launcher = [str(linux_dir / "fgo-launcher.sh")]
+        status = "Launching..."
         try:
-            subprocess.Popen([str(linux_dir / "fgo-launcher.sh")])
+            if self.log_terminal_var.get():
+                # The launcher writes to a file and the terminal only tails it, so
+                # closing the terminal never takes the game down with it.
+                log_path = install_root() / "logs" / "fgo-console.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_path, "w", encoding="utf-8") as log_file:
+                    subprocess.Popen(launcher, stdout=log_file, stderr=subprocess.STDOUT)
+                viewer = terminal_command(["tail", "-n", "+1", "-F", str(log_path)])
+                if viewer:
+                    subprocess.Popen(viewer, start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    status = f"Launching... (no terminal found - log: {log_path})"
+            else:
+                subprocess.Popen(launcher)
         except Exception as exc:
             messagebox.showerror("Could not launch", str(exc))
             return
-        self.status_var.set("Launching...")
+        self.status_var.set(status)
         self._shader_cache_dir = self._find_shader_cache_dir()
         self._shader_baseline = self._count_shader_files(self._shader_cache_dir)
         self._shader_last_count = self._shader_baseline
