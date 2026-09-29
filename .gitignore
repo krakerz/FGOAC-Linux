@@ -1,0 +1,43 @@
+# Machine-specific config - real paths and secrets (DB password, etc).
+# linux/fgo.env.example is the tracked template; never commit the real file.
+linux/fgo.env
+.env
+.env.*
+!.env.example
+
+# Generated/local - safe to delete and regenerate (setup.sh recreates it).
+linux/venv/
+linux/backups/
+linux/logs/
+**/__pycache__/
+*.pyc
+*.dmp
+
+# Decompiled scooby launcher source, kept locally for reference only - not
+# part of this repo, and not ours to redistribute.
+/scooby/
+
+# Card name/effect translation data - copied from scooby's own
+# FGOLocalPlatform.CardNames.json/CraftEffects.json for local convenience,
+# not ours to redistribute (scooby ships no LICENSE granting that). The Deck
+# tab finds these dynamically (FGO_SCOOBY_SRC in fgo.env, or a copy dropped
+# here) and degrades gracefully to untranslated names without them.
+linux/tools/data/*.json
+
+# A game install ever copied under the project root for local testing (see
+# the root README's Configuration section) - never the game itself, only
+# this repo's own linux/ scripts and docs.
+/App/
+/AMFS/
+/DEVICE/
+/GameData/
+/Server/
+/compat/
+/payload/
+/logs/
+/manifest.json
+/FGOAC scooby.exe
+/FGOLocalPlatform.*
+/ZstdSharp.dll
+/_en-patch-backup/
+/_update-backup/
