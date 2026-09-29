@@ -134,7 +134,11 @@ which does not cover this) to `App/fgoglcompat.dll`; `fgo-launcher.sh`
 already injects it automatically via `-k` if present. Cards with native
 `GL_ARB_bindless_texture` support (check with `glxinfo | grep bindless`)
 also need a Mesa driconf override, since `ago.exe` hits a GLSL compile error
-Mesa rejects by default:
+Mesa rejects by default - `fgo-launcher.sh` self-heals this automatically on
+every launch (`linux/tools/ensure_drirc.py`): it adds the stanza below to
+`~/.drirc` if it's missing, parsing any existing file first so other games'
+own driconf entries are never touched or overwritten; a file that isn't
+recognizable driconf XML is left alone entirely rather than guessed at.
 
 ```xml
 <!-- ~/.drirc -->
@@ -148,7 +152,7 @@ Mesa rejects by default:
 </driconf>
 ```
 
-Purge `App/shader-cache-r10/` once after adding this if the cache already
+Purge `App/shader-cache-r10/` once after this is added if the cache already
 has entries from before.
 
 ## Script map

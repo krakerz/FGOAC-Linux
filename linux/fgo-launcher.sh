@@ -60,6 +60,46 @@ if [ ! -f "$gl_compat_path" ] && [ ! -f "$game_root/opengl32.dll" ] && [ -f "$in
     fgo_log "GPU compat: deployed compat/fgoglcompat.dll (Legacy layer) to App/ - fresh install had neither compat layer."
 fi
 
+# Self-heal: cards with native GL_ARB_bindless_texture support (check with
+# `glxinfo | grep bindless`) still need a Mesa driconf override on top of the
+# compat layer above, or ago.exe hits a GLSL compile error Mesa rejects by
+# default - see the root README's "GPU compatibility" section. ~/.drirc is a
+# system-wide per-user file that can hold other games' own stanzas, so this
+# only ever adds ours if missing (parses the existing XML, preserving
+# everything else byte-for-byte) - never overwrites the file, and leaves it
+# alone entirely if it isn't recognizable driconf XML.
+"$FGO_PYTHON" "$SCRIPT_DIR/tools/ensure_drirc.py" 2>&1 | while IFS= read -r drirc_line; do fgo_log "$drirc_line"; done
+
+# Self-heal: modern Wine (11.0+, the only branches this game runs on) links
+# wined3d.dll's own Vulkan backend against libvkd3d-*.dll - a real, load-time
+# dependency, not optional. A Proton build ships those PE DLLs in its own
+# files/share/default_pfx template, but only Steam's own Proton "run"/setup
+# step copies that template into a fresh prefix; calling this build's wine
+# binary directly (as this script does) never does that copy at all, so a
+# prefix that's never been launched through Steam itself is permanently
+# missing them. Symptom without this: ago.exe fails at its very first d3d9
+# import (wined3d.dll -> libvkd3d-*.dll not found, status c0000135) and
+# exits within a second or a few seconds in - confirmed on two separate
+# wine-11.0 builds/prefixes (Proton-GE and Proton-CachyOS) on 2026-09-29.
+# Only fills in what's missing - never overwrites a real vkd3d install.
+proton_root="${FGO_WINE%/files/bin/wine}"
+if [ "$proton_root" != "${FGO_WINE:-}" ] && [ -d "$proton_root/files/share/default_pfx" ]; then
+    for arch_dir in system32 syswow64; do
+        default_dir="$proton_root/files/share/default_pfx/drive_c/windows/$arch_dir"
+        [ -d "$default_dir" ] || continue
+        target_dir="$WINEPREFIX/drive_c/windows/$arch_dir"
+        mkdir -p "$target_dir"
+        for dll in "$default_dir"/libvkd3d-*.dll; do
+            [ -e "$dll" ] || continue
+            dll_name=$(basename "$dll")
+            if [ ! -f "$target_dir/$dll_name" ]; then
+                cp "$dll" "$target_dir/$dll_name"
+                fgo_log "Wine compat: copied $dll_name into the prefix's $arch_dir (this Proton build's own default_pfx was never applied to this prefix)."
+            fi
+        done
+    done
+fi
+
 # Keep the shader cache (App/shader-cache-rN/ - the folder name's numeric
 # suffix is tied to the game version) outside the install so a fresh/
 # regenerated install doesn't force a ~45-90s cold shader recompile every
