@@ -26,6 +26,10 @@ if [ -f "$game_pidfile" ]; then
     while fgo_pid_alive "$game_pid"; do sleep 1; done
 fi
 
+# A relaunch kills the previous game and starts its own launcher; keep the
+# server up for that newer session instead of stopping it underneath it.
+while pgrep -f "bash $SCRIPT_DIR/fgo-launcher\.sh" >/dev/null 2>&1; do sleep 2; done
+
 {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Launcher and game exited; stopping this installation's server (launcher=$launcher_pid)."
     "$SCRIPT_DIR/stop-fgo-local-server.sh"

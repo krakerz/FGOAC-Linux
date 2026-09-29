@@ -17,6 +17,10 @@ linux/logs/
 # part of this repo, and not ours to redistribute.
 /scooby/
 
+# Upstream segatools checkout (its own git repo), kept locally for reading the
+# hook sources - not part of this repo.
+/segatools/
+
 # Card name/effect translation data - copied from scooby's own
 # FGOLocalPlatform.CardNames.json/CraftEffects.json for local convenience,
 # not ours to redistribute (scooby ships no LICENSE granting that). The Deck

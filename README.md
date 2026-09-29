@@ -105,7 +105,7 @@ reads:
 | `requiredPorts` | Ports `fgo-launcher.sh` checks are open before launching. **Must match `serverPorts` below and `core.yaml`** - if you remap a port in one, remap it everywhere, or you'll get `not reachable on required port(s): ...`. `fix-server-config.sh` does this consistently in one step. |
 | `serverPorts.http` / `.billing` / `.aime` | ALL.Net/billing/AimeDB ports. Linux won't let an unprivileged process bind ports below 1024, hence `http` defaults to `8777` (not the distribution's original `777`) everywhere these scripts touch it. |
 | `chineseEnabled` | Despite the name, this is really "use `App/zh` for text" - it's the switch `apply-en-patch.sh` turns on, since the English patch replaces the contents of `App/zh` rather than adding a new folder. |
-| `displayMode`, `resolutionWidth/Height`, `windowed`, `monitorDevice` | Passed straight through to the game/`fgohook`. |
+| `displayMode`, `resolutionWidth/Height`, `windowed`, `monitorDevice` | Passed straight through to the game/`fgohook`. `monitorDevice` (a `\\.\DISPLAYN` string) barely matters under Wine - confirmed working even set to a monitor index that doesn't exist on the real hardware, since Wine's GDI emulation falls back gracefully rather than failing. Not exposed in the GUI, not worth fiddling with. |
 | `autoStartLocalServer` | Whether `fgo-launcher.sh` starts `start-fgo-local-server.sh` itself before launching. |
 
 ### `Server/artemis/config/core.yaml` (your game install, not this repo)
@@ -207,16 +207,3 @@ above:
   `fgo-launcher.sh` as the first `-k` argument if present - see
   `linux/shims/README.md`. Confirmed on Wine 11.17 and CachyOS's
   wine-10.0-20260425.
-
-## Current status
-
-The launcher, ARTEMiS server, English patch application, and account
-management (via the distribution's own `FGOAC scooby.exe` GUI) all run
-end-to-end under Wine/Proton, and `ago.exe` itself reaches a stable,
-crash-free running state (confirmed: shaders compile, audio plays, the
-title screen loads) once the GPU compatibility steps above are done. The
-one known remaining issue is the game's own window occasionally not
-becoming visible on-screen right after launch (an intermittent Wine/window-
-manager focus race, not a crash - the game keeps running fine underneath;
-just relaunch if this happens) - see the project's own NOTES.md for the
-full investigation.
