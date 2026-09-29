@@ -24,6 +24,9 @@ FGO_CONFIG_FILE=${FGO_CONFIG_FILE:-$FGO_LINUX_DIR/fgo.env}
 if [ -f "$FGO_CONFIG_FILE" ]; then
     . "$FGO_CONFIG_FILE"
 fi
+# fgo.env's assignments aren't exported by sourcing; without this wine never
+# saw WINEPREFIX and silently ran the game in ~/.wine.
+[ -n "${WINEPREFIX:-}" ] && export WINEPREFIX
 
 : "${FGO_PYTHON:=python3}"
 

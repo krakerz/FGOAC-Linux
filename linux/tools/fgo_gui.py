@@ -20,11 +20,13 @@ placeholder until a valid install root is set.
 """
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -134,6 +136,18 @@ KEY_CHOICES = [
     *_FKEYS,
 ]
 KEY_VALUE_TO_NAME = {v: n for n, v in KEY_CHOICES}
+
+# fgohook photo mode (fgo-launcher.json graphics.photo, scooby's PhotoWindow
+# format). Keys go to the hook at game start (FGO_PHOTO_KEY/FGO_PHOTO_KEYS);
+# the numeric settings are pushed live through linux/shims/photo_bridge.exe.
+PHOTO_KEY_ACTIONS = ["Enter / exit photo mode", "Move forward", "Move back", "Move left", "Move right",
+                     "Move down", "Move up", "Turn left", "Turn right", "Look up", "Look down",
+                     "Roll left", "Roll right", "Reset camera"]
+PHOTO_DEFAULT_KEYS = [120, 87, 83, 65, 68, 81, 69, 37, 39, 38, 40, 90, 67, 82]
+PHOTO_SETTINGS = [  # (json key, label, min, max, default)
+    ("speed", "Move speed", 0.05, 10.0, 1.0), ("focus", "Focus distance", 0.1, 100.0, 3.0),
+    ("focusRange", "Focus range", 0.0, 20.0, 0.3), ("falloff", "Blur falloff", 0.01, 50.0, 1.0),
+    ("blur", "Blur radius", 0.0, 8.0, 4.0)]
 
 KEYBOARD_ACTIONS = [
     ("Move Up", "up", 0x57), ("Move Down", "down", 0x53),
@@ -1005,6 +1019,9 @@ class DisplayTab(ttk.Frame):
         notebook.add(basic, text="Basic")
         notebook.add(advanced, text="Advanced Graphics")
         notebook.add(audio, text="Audio")
+        photo = ttk.Frame(notebook, padding=16)
+        notebook.add(photo, text="Photo Mode")
+        self._build_photo_tab(photo)
 
         row = 0
         ttk.Label(basic, text="Resolution:").grid(row=row, column=0, sticky="w", pady=4)
@@ -1211,6 +1228,71 @@ class DisplayTab(ttk.Frame):
         for var in self.volume_vars.values():
             var.set(value)
 
+    def _build_photo_tab(self, frame):
+        photo = self.graphics_data.get("photo") if isinstance(self.graphics_data.get("photo"), dict) else {}
+        saved_keys = photo.get("keys") if isinstance(photo.get("keys"), list) and len(photo["keys"]) == 14 else []
+        ttk.Label(frame, text="The game's built-in free camera. Key changes apply the next time the game starts; "
+                              "while in photo mode you can also drag with the mouse and scroll to zoom "
+                              "(Shift = faster, Ctrl = finer).",
+                  foreground="gray", wraplength=560).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        key_names = [n for n, v in KEY_CHOICES if v >= 8]
+        self.photo_key_vars = []
+        for i, action in enumerate(PHOTO_KEY_ACTIONS):
+            value = saved_keys[i] if i < len(saved_keys) and isinstance(saved_keys[i], int) and 8 <= saved_keys[i] <= 254 \
+                else PHOTO_DEFAULT_KEYS[i]
+            var = tk.StringVar(value=KEY_VALUE_TO_NAME.get(value, f"0x{value:X}"))
+            names = key_names if var.get() in key_names else key_names + [var.get()]
+            row, col = 1 + i % 7, (i // 7) * 2
+            ttk.Label(frame, text=action + ":").grid(row=row, column=col, sticky="w", pady=2, padx=(0 if col == 0 else 16, 6))
+            ttk.Combobox(frame, textvariable=var, values=names, state="readonly", width=14).grid(row=row, column=col + 1, sticky="w")
+            self.photo_key_vars.append(var)
+        ttk.Button(frame, text="Default keys", command=lambda: [v.set(KEY_VALUE_TO_NAME[k]) for v, k in
+                                                                zip(self.photo_key_vars, PHOTO_DEFAULT_KEYS)]).grid(
+            row=8, column=0, sticky="w", pady=(6, 12))
+
+        ttk.Label(frame, text="Camera and depth of field (sent to the game by the live panel):",
+                  font=("", 10, "bold")).grid(row=9, column=0, columnspan=4, sticky="w")
+        self.photo_dof_var = tk.BooleanVar(value=bool(photo.get("dof", False)))
+        ttk.Checkbutton(frame, text="Custom depth of field", variable=self.photo_dof_var).grid(
+            row=10, column=0, columnspan=2, sticky="w", pady=(4, 2))
+        self.photo_setting_vars = {}
+        for i, (key, label, lo, hi, default) in enumerate(PHOTO_SETTINGS):
+            value = photo.get(key, default)
+            value = min(max(float(value), lo), hi) if isinstance(value, (int, float)) else default
+            var = tk.StringVar(value=f"{value:g}")
+            ttk.Label(frame, text=f"{label} ({lo:g}-{hi:g}):").grid(row=11 + i, column=0, sticky="w", pady=2)
+            ttk.Entry(frame, textvariable=var, width=10).grid(row=11 + i, column=1, sticky="w")
+            self.photo_setting_vars[key] = var
+        ttk.Button(frame, text="Open live photo panel...", command=self._open_photo_panel).grid(
+            row=16, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+    def _photo_values(self):
+        name_to_value = {n: v for n, v in KEY_CHOICES}
+        keys = []
+        for action, var in zip(PHOTO_KEY_ACTIONS, self.photo_key_vars):
+            name = var.get()
+            keys.append(name_to_value[name] if name in name_to_value else int(name, 16))
+        if len(set(keys)) != len(keys):
+            raise ValueError("Two photo mode keys are the same - give each action its own key.")
+        values = {"keys": keys, "dof": self.photo_dof_var.get()}
+        for key, label, lo, hi, _default in PHOTO_SETTINGS:
+            try:
+                number = float(self.photo_setting_vars[key].get())
+            except ValueError:
+                raise ValueError(f"Photo mode {label.lower()} must be a number.")
+            if not lo <= number <= hi:
+                raise ValueError(f"Photo mode {label.lower()} must be between {lo:g} and {hi:g}.")
+            values[key] = number
+        return values
+
+    def _open_photo_panel(self):
+        try:
+            settings = self._photo_values()
+        except ValueError as exc:
+            messagebox.showerror("Photo mode", str(exc))
+            return
+        PhotoPanel(self.winfo_toplevel(), settings)
+
     def validate(self):
         try:
             width = int(self.width_var.get())
@@ -1270,6 +1352,7 @@ class DisplayTab(ttk.Frame):
         width, height, fps, damage = self.validate()
         gamescope_env = self._gamescope_env_values()
         gamescope_env["FGO_UNLOCK_HIGH_FPS"] = "1" if fps > 60 else "0"
+        photo_values = self._photo_values()
         damage_number_scale, damage_number_opacity, damage_texture_scale, damage_texture_opacity = damage
         self.config_data["resolutionWidth"] = width
         self.config_data["resolutionHeight"] = height
@@ -1307,6 +1390,13 @@ class DisplayTab(ttk.Frame):
             "hideCabinetHud": self.hide_cabinet_hud_var.get(),
             "hideUiKey": resolve_key(self.hide_ui_key_var.get()),
         })
+        photo = self.graphics_data.get("photo") if isinstance(self.graphics_data.get("photo"), dict) else {}
+        if photo.get("panelKey") in photo_values["keys"]:
+            # scooby refuses to save photo settings when a camera key equals its panel hotkey.
+            raise ValueError(f"{KEY_VALUE_TO_NAME.get(photo['panelKey'], photo['panelKey'])} is scooby's photo "
+                             "panel key - pick a different photo mode key.")
+        photo.update(photo_values)  # keeps scooby-only fields such as panelKey
+        self.graphics_data["photo"] = photo
         self.config_data["graphics"] = self.graphics_data
         save_launcher_json(self.config_data)
         save_audio_volume({key: int(round(var.get())) for key, var in self.volume_vars.items()})
@@ -1320,6 +1410,172 @@ class DisplayTab(ttk.Frame):
         self.gamescope_output_height_entry.configure(state=state)
         fsr_state = "normal" if (gamescope_on and self.gamescope_fsr_var.get()) else "disabled"
         self.fsr_sharpness_entry.configure(state=fsr_state)
+
+class PhotoBridge:
+    """linux/shims/photo_bridge.exe run under the game's own wine/prefix (a native
+    process can't open the hook's Wine named mapping). One worker thread does all
+    pipe I/O so a slow wine start never blocks the Tk loop."""
+
+    def __init__(self):
+        env_text = read_env_file()
+        env = dict(os.environ, WINEDEBUG="-all")
+        # Must join the game's own wineserver: use the running ago.exe's
+        # WINEPREFIX (unset there = wine's default prefix). With no game
+        # running, inherit this process's env - the same env Play hands the
+        # launcher, so it matches the prefix the game will start in.
+        game_env = self._running_game_env()
+        if game_env is not None:
+            if "WINEPREFIX" in game_env:
+                env["WINEPREFIX"] = game_env["WINEPREFIX"]
+            else:
+                env.pop("WINEPREFIX", None)
+        wine = get_env_value(env_text, "FGO_WINE") or "wine"
+        exe = Path(__file__).resolve().parent.parent / "shims" / "photo_bridge.exe"
+        self.process = subprocess.Popen([wine, str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+        self.requests = queue.Queue()
+        self.replies = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def _running_game_env():
+        result = subprocess.run(["pgrep", "-x", "ago.exe"], capture_output=True, text=True)
+        for pid in result.stdout.split():
+            try:
+                raw = Path(f"/proc/{pid}/environ").read_bytes()
+            except OSError:
+                continue
+            return dict(item.split("=", 1) for item in raw.decode(errors="replace").split("\0") if "=" in item)
+        return None
+
+    def _run(self):
+        while True:
+            line = self.requests.get()
+            if line is None:
+                return
+            try:
+                self.process.stdin.write(line + "\n")
+                self.process.stdin.flush()
+                reply = self.process.stdout.readline()
+            except (OSError, ValueError):
+                reply = ""
+            if not reply:
+                self.replies.put((line, {"connected": False, "stopped": True}))
+                return
+            try:
+                self.replies.put((line, json.loads(reply)))
+            except ValueError:
+                pass
+
+    def send(self, line):
+        self.requests.put(line)
+
+    def close(self):
+        self.requests.put("quit")
+        self.requests.put(None)
+        try:
+            self.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+
+
+class PhotoPanel(tk.Toplevel):
+    """Live controls for fgohook's photo mode - the Linux counterpart of scooby's
+    Photo window's camera part (speed, FOV, depth of field, commands)."""
+
+    def __init__(self, parent, settings):
+        super().__init__(parent)
+        self.title("Photo mode")
+        self.resizable(False, False)
+        self.settings = settings
+        self.bridge = PhotoBridge()
+        self.connected = False
+        self.active = False
+        self.status_pending = False
+        self.status_var = tk.StringVar(value="Starting the bridge (first start can take a few seconds)...")
+        ttk.Label(self, textvariable=self.status_var, wraplength=420).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 8))
+        buttons = ttk.Frame(self)
+        buttons.grid(row=1, column=0, columnspan=3, sticky="w", padx=12)
+        for text, command in (("Enter / Exit", 1), ("Reset camera", 2), ("Resume game", 4)):
+            ttk.Button(buttons, text=text, command=lambda c=command: self.bridge.send(f"cmd {c}")).pack(
+                side="left", padx=(0, 8))
+
+        self.fov_var = tk.DoubleVar(value=32.0)
+        self.speed_var = tk.DoubleVar(value=settings["speed"])
+        self.dof_var = tk.BooleanVar(value=settings["dof"])
+        self.dof_vars = {key: tk.DoubleVar(value=settings[key]) for key in ("focus", "focusRange", "falloff", "blur")}
+        row = 2
+        row = self._slider(row, "FOV", self.fov_var, 5, 150, 0.5, lambda _v: self.bridge.send(f"fov {self.fov_var.get():.3f}"))
+        row = self._slider(row, "Move speed", self.speed_var, 0.05, 10, 0.05,
+                           lambda _v: self.bridge.send(f"speed {self.speed_var.get():.3f}"))
+        ttk.Checkbutton(self, text="Custom depth of field", variable=self.dof_var, command=self._send_dof).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 0))
+        row += 1
+        for key, label, lo, hi, _default in PHOTO_SETTINGS[1:]:
+            row = self._slider(row, label, self.dof_vars[key], lo, hi, 0.01 if hi <= 20 else 0.1,
+                               lambda _v: self._send_dof())
+        ttk.Label(self, text="Save these as defaults in Game Settings > Photo Mode.", foreground="gray").grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 12))
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.poll_id = self.after(200, self._poll)
+
+    def _slider(self, row, label, var, lo, hi, resolution, on_change):
+        ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", padx=(12, 8))
+        tk.Scale(self, variable=var, from_=lo, to=hi, resolution=resolution, orient="horizontal", length=300,
+                 command=on_change).grid(row=row, column=1, sticky="w")
+        return row + 1
+
+    def _send_dof(self):
+        values = " ".join(f"{self.dof_vars[k].get():.3f}" for k in ("focus", "focusRange", "falloff", "blur"))
+        self.bridge.send(f"dof {1 if self.dof_var.get() else 0} {values}")
+
+    def _poll(self):
+        try:
+            while True:
+                line, reply = self.bridge.replies.get_nowait()
+                if line == "status":
+                    self.status_pending = False
+                    self._show_status(reply)
+                elif reply.get("stopped"):
+                    self._show_status(reply)
+        except queue.Empty:
+            pass
+        if not self.status_pending:
+            self.status_pending = True
+            self.bridge.send("status")
+        self.poll_id = self.after(500, self._poll)
+
+    def _show_status(self, status):
+        if status.get("stopped"):
+            self.status_var.set("The photo bridge stopped - close and reopen this window.")
+            return
+        connected = bool(status.get("connected"))
+        if connected and not self.connected:
+            # Like scooby: push the configured speed and depth of field on connect.
+            self.bridge.send(f"speed {self.speed_var.get():.3f}")
+            self._send_dof()
+        self.connected = connected
+        active = bool(status.get("active"))
+        if active and not self.active and status.get("fov"):
+            self.fov_var.set(round(float(status["fov"]), 1))  # start the slider at the game's own FOV
+        self.active = active
+        if not connected:
+            self.status_var.set("Waiting for the game... (start it with Save & Play; photo mode needs a scene "
+                                "with a camera, e.g. the lobby)")
+        elif self.active:
+            x, y, z = status.get("pos", [0, 0, 0])
+            self.status_var.set(f"In photo mode - camera at {x:.2f}, {y:.2f}, {z:.2f}, FOV {status.get('fov', 0):.1f}")
+        else:
+            self.status_var.set("Connected to the game - photo mode off (press the photo key or Enter / Exit)")
+
+    def _close(self):
+        self.after_cancel(self.poll_id)
+        if self.active:
+            self.bridge.send("cmd 4")
+        self.bridge.close()
+        self.destroy()
+
 
 class ControlsTab(ttk.Frame):
     def __init__(self, parent):
