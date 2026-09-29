@@ -17,7 +17,9 @@
 #
 # Env overrides (all optional): FGO_INPUT_MODE, FGO_DISPLAY_MODE,
 # FGO_MONITOR_DEVICE, FGO_RESOLUTION_WIDTH, FGO_RESOLUTION_HEIGHT,
-# FGO_TARGET_FPS, FGO_RENDER_SCALE.
+# FGO_TARGET_FPS, FGO_RENDER_SCALE, FGO_GAMESCOPE, FGO_GAMESCOPE_FULLSCREEN,
+# FGO_GAMESCOPE_FSR, FGO_GAMESCOPE_SHARPNESS, FGO_GAMESCOPE_OUTPUT_WIDTH,
+# FGO_GAMESCOPE_OUTPUT_HEIGHT, FGO_GAMESCOPE_BACKEND, FGO_GAMESCOPE_EXTRA_ARGS.
 # Flags: --windowed --skip-server-check --chinese --experimental-audio --check-only
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +50,7 @@ main_config_path="$game_root/config.json"
 inject_path="$game_root/inject.exe"
 hook_path="$game_root/fgohook.dll"
 pending_hook_path="$game_root/fgohook.pending.dll"
+high_fps_hook_path="$game_root/fgohook-highfps.dll"
 gl_compat_path="$game_root/fgoglcompat.dll"
 # Self-heal a fresh/regenerated install: ago.exe calls NVIDIA-only OpenGL
 # bindless-buffer extensions unconditionally, and on non-NVIDIA (Mesa) GPUs
@@ -281,8 +284,12 @@ case "$configured_target_fps" in 60|90|120|144) ;; *) configured_target_fps=60 ;
 requested_target_fps=${FGO_TARGET_FPS:-$configured_target_fps}
 effective_target_fps=$requested_target_fps
 if [ "$effective_target_fps" -gt 60 ]; then
-    fgo_warn "High-FPS engine scheduling is suspended after UI/touch regressions; using native 60 FPS."
-    effective_target_fps=60
+    if [ "${FGO_UNLOCK_HIGH_FPS:-0}" = "1" ]; then
+        fgo_warn "FGO_UNLOCK_HIGH_FPS=1: ${effective_target_fps} FPS via a patched hook copy - the hook author's experimental high-FPS mode, disabled upstream after UI/touch regressions."
+    else
+        fgo_warn "High-FPS engine scheduling is suspended after UI/touch regressions; using native 60 FPS."
+        effective_target_fps=60
+    fi
 fi
 
 use_audio_hook=0
@@ -469,7 +476,11 @@ feedback_shim_path="$SCRIPT_DIR/shims/feedback_shim.dll"
 [ -f "$feedback_shim_path" ] && launch_arguments+=(-k "$feedback_shim_path")
 [ "$use_process_japanese_locale" -eq 1 ] && launch_arguments+=(-k "$locale_hook_path")
 [ -f "$gl_compat_path" ] && launch_arguments+=(-k "$gl_compat_path")
-launch_arguments+=(-k "$hook_path")
+if [ "${FGO_UNLOCK_HIGH_FPS:-0}" = "1" ]; then
+    launch_arguments+=(-k "$high_fps_hook_path")
+else
+    launch_arguments+=(-k "$hook_path")
+fi
 use_chinese=0
 [ "$opt_chinese" -eq 1 ] && use_chinese=1
 [ "$CFG_CHINESEENABLED" = "1" ] && use_chinese=1
@@ -592,6 +603,11 @@ if [ -f "$pending_hook_path" ]; then
     fgo_log "Installed staged FGO compatibility hook; backup: $backup_directory/fgohook-before-update-$stamp.dll"
 fi
 
+if [ "${FGO_UNLOCK_HIGH_FPS:-0}" = "1" ]; then
+    "$FGO_PYTHON" "$SCRIPT_DIR/tools/patch_fgohook_highfps.py" "$hook_path" "$high_fps_hook_path" \
+        || fgo_die "FGO_UNLOCK_HIGH_FPS=1 but $hook_path could not be patched (see above). Unset it to launch normally." 1
+fi
+
 pending_bgm_directory="$game_root/BGM/pending"
 if [ -d "$pending_bgm_directory" ]; then
     bgm_backup_directory="$game_root/backup/bgm-$(date +%Y%m%d_%H%M%S)"
@@ -621,15 +637,48 @@ cd "$game_root" || fgo_die "Cannot enter $game_root" 1
 # withdrawn/invisible (see NOTES.md) by giving the game its own compositor
 # to own start to finish, and centralizes fullscreen/resolution presentation
 # in one place instead of Windows-style displayMode/monitorDevice settings.
-# Opt-in via FGO_GAMESCOPE=1 in fgo.env; inner size matches whatever
-# resolution is already configured (effective_resolution_width/height) - no
-# separate gamescope-specific size setting to keep in sync.
+# Opt-in via FGO_GAMESCOPE=1 in fgo.env. -w/-h (nested = what the game itself
+# renders at) always matches effective_resolution_width/height, same as
+# without gamescope - no separate "game resolution" setting to keep in sync.
+# -W/-H (output = what's actually displayed) defaults to that same size too
+# (no upscaling, previous behavior), unless FGO_GAMESCOPE_OUTPUT_WIDTH/HEIGHT
+# request a larger one - that gap between rendered and displayed size is
+# exactly what FGO_GAMESCOPE_FSR=1 (gamescope's own AMD FSR 1.0 upscaler,
+# -F fsr) then scales across, independent of GPU vendor since it's a
+# compositor-side shader, not a driver feature.
 launch_cmd=("${FGO_WINE:-wine}" "$inject_path" "${launch_arguments[@]}")
 if [ "${FGO_GAMESCOPE:-0}" = "1" ]; then
     fgo_require_cmd gamescope
-    gamescope_args=(-W "$effective_resolution_width" -H "$effective_resolution_height")
+    gamescope_output_width=${FGO_GAMESCOPE_OUTPUT_WIDTH:-$effective_resolution_width}
+    gamescope_output_height=${FGO_GAMESCOPE_OUTPUT_HEIGHT:-$effective_resolution_height}
+    gamescope_args=(
+        -w "$effective_resolution_width" -h "$effective_resolution_height"
+        -W "$gamescope_output_width" -H "$gamescope_output_height"
+    )
     [ "${FGO_GAMESCOPE_FULLSCREEN:-0}" = "1" ] && gamescope_args+=(-f)
+    # Windowed gamescope on its auto-picked Wayland backend stalls the game
+    # after its first presented frame (no window ever maps); the SDL backend
+    # renders normally. Fullscreen is fine on auto, so it's left alone.
+    gamescope_backend=${FGO_GAMESCOPE_BACKEND:-}
+    if [ -z "$gamescope_backend" ] && [ "${FGO_GAMESCOPE_FULLSCREEN:-0}" != "1" ]; then
+        gamescope_backend=sdl
+    fi
+    [ -n "$gamescope_backend" ] && gamescope_args+=(--backend "$gamescope_backend")
+    if [ "${FGO_GAMESCOPE_FSR:-0}" = "1" ]; then
+        gamescope_args+=(-F fsr)
+        [ -n "${FGO_GAMESCOPE_SHARPNESS:-}" ] && gamescope_args+=(--sharpness "$FGO_GAMESCOPE_SHARPNESS")
+    fi
+    if [ -n "${FGO_GAMESCOPE_EXTRA_ARGS:-}" ]; then
+        read -ra extra_gamescope_args <<< "$FGO_GAMESCOPE_EXTRA_ARGS"
+        gamescope_args+=("${extra_gamescope_args[@]}")
+    fi
     launch_cmd=(gamescope "${gamescope_args[@]}" -- "${launch_cmd[@]}")
+    # SDL's native-Wayland window can race KWin ("attached a buffer before
+    # configure event") and lose its connection, leaving gamescope running
+    # with no window at all. SDL over X11 (XWayland) doesn't have that race.
+    if [ "$gamescope_backend" = "sdl" ] && [ -n "${DISPLAY:-}" ]; then
+        launch_cmd=(env SDL_VIDEODRIVER=x11 SDL_VIDEO_DRIVER=x11 "${launch_cmd[@]}")
+    fi
 fi
 
 "${launch_cmd[@]}" \
@@ -638,8 +687,55 @@ fi
 game_pid=$!
 mkdir -p "$state_dir"
 echo "$game_pid" > "$state_dir/game.pid"
+
+# gamescope's reaper waits for every descendant, and Wine's helper processes
+# (winedevice.exe etc.) can outlive ago.exe or deadlock - gamescope then never
+# exits and this launcher hangs with an empty window. Once this session's own
+# ago.exe is gone, kill the rest of its process tree (descendants only, so a
+# newer session of this install is never touched).
+gamescope_cleanup_flag="$state_dir/gamescope-cleanup.$$"
+rm -f "$gamescope_cleanup_flag"
+descendants() { local child; for child in $(ps -o pid= --ppid "$1" 2>/dev/null); do echo "$child"; descendants "$child"; done; }
+has_game_descendant() {
+    local pid
+    for pid in $(descendants "$1"); do
+        [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "ago.exe" ] && return 0
+    done
+    return 1
+}
+watchdog_pid=""
+if [ "${FGO_GAMESCOPE:-0}" = "1" ]; then
+    (
+        seen_game=0 idle_ticks=0 waited=0
+        while fgo_pid_alive "$game_pid"; do
+            if has_game_descendant "$game_pid"; then
+                seen_game=1 idle_ticks=0
+            else
+                idle_ticks=$((idle_ticks + 1))
+            fi
+            waited=$((waited + 2))
+            # 3 idle ticks after the game ran, or 3 minutes with it never starting.
+            if { [ "$seen_game" -eq 1 ] && [ "$idle_ticks" -ge 3 ]; } || { [ "$seen_game" -eq 0 ] && [ "$waited" -ge 180 ]; }; then
+                [ "$seen_game" -eq 1 ] && : > "$gamescope_cleanup_flag"
+                leftover=$(descendants "$game_pid")
+                [ -n "$leftover" ] && kill -9 $leftover 2>/dev/null
+                break
+            fi
+            sleep 2
+        done
+    ) &
+    watchdog_pid=$!
+fi
+
 wait "$game_pid"
 game_exit_code=$?
+[ -n "$watchdog_pid" ] && kill "$watchdog_pid" 2>/dev/null
+if [ -f "$gamescope_cleanup_flag" ]; then
+    # We killed gamescope's leftovers after ago.exe had already exited; its
+    # exit status reflects that kill, not how the game itself ended.
+    rm -f "$gamescope_cleanup_flag"
+    game_exit_code=0
+fi
 rm -f "$state_dir/game.pid"
 
 session_seconds=$(( $(date +%s) - launch_start ))

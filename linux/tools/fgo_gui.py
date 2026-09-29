@@ -163,6 +163,7 @@ ANISOTROPY_VALUE_TO_NAME = {v: n for n, v in ANISOTROPY_CHOICES}
 RENDER_SCALE_CHOICES = [("100% (native)", 100), ("125% (1.56x pixels)", 125),
                          ("150% (2.25x pixels)", 150), ("200% (4x pixels)", 200)]
 RENDER_SCALE_VALUE_TO_NAME = {v: n for n, v in RENDER_SCALE_CHOICES}
+FPS_CHOICES = [("60", 60), ("120 (experimental)", 120)]
 SHADOW_RESOLUTION_CHOICES = [("Game default", 0), ("1024 x 1024", 1024), ("2048 x 2048", 2048), ("4096 x 4096", 4096)]
 SHADOW_RESOLUTION_VALUE_TO_NAME = {v: n for n, v in SHADOW_RESOLUTION_CHOICES}
 
@@ -946,10 +947,16 @@ class SetupTab(ttk.Frame):
 
 
 class DisplayTab(ttk.Frame):
-    """monitorDevice is deliberately not exposed here (per-machine, fiddly to
-    get right, and fgo-launcher.sh fgo_die()s on an invalid value) -
+    """monitorDevice is deliberately not exposed here. Not because it's
+    fiddly to get right - confirmed 2026-09-29 it barely matters at all: a
+    value naming a monitor that doesn't even exist on the real hardware
+    (e.g. "\\\\.\\DISPLAY5" with only 3 real monitors connected) still
+    launches and displays fine, on Wine or gamescope. fgo-launcher.sh only
+    format-validates this field (matches \\\\.\\DISPLAYN), never checks it
+    against a real enumerated display, and Wine's own GDI emulation falls
+    back gracefully rather than failing when the named device isn't found.
     config_data still carries whatever's already on disk and save() never
-    touches that key, so it round-trips untouched."""
+    touches that key, so it round-trips untouched regardless."""
 
     def __init__(self, parent):
         super().__init__(parent, padding=16)
@@ -986,17 +993,67 @@ class DisplayTab(ttk.Frame):
         row += 1
 
         ttk.Label(basic, text="Target FPS:").grid(row=row, column=0, sticky="w", pady=4)
-        self.fps_var = tk.StringVar(value=str(self.config_data.get("targetFps", 60)))
-        ttk.Entry(basic, textvariable=self.fps_var, width=8).grid(row=row, column=1, sticky="w")
+        # 120 needs both targetFps=120 and FGO_UNLOCK_HIGH_FPS=1 (fgo.env) -
+        # anything else actually runs at 60, so show 60.
+        unlocked = get_env_value(read_env_file(), "FGO_UNLOCK_HIGH_FPS") == "1"
+        current_fps = 120 if unlocked and self.config_data.get("targetFps") == 120 else 60
+        self.fps_var = tk.StringVar(value={v: n for n, v in FPS_CHOICES}[current_fps])
+        ttk.Combobox(basic, textvariable=self.fps_var, values=[n for n, _ in FPS_CHOICES],
+                     state="readonly", width=20).grid(row=row, column=1, columnspan=3, sticky="w")
+        row += 1
+        ttk.Label(basic, text="120 loads a one-byte-patched copy of fgohook.dll (the original is untouched). "
+                              "Experimental: runs the GPU much harder, and menus/touch may misbehave.",
+                  foreground="gray", wraplength=520).grid(row=row, column=0, columnspan=4, sticky="w")
         row += 1
 
-        self.gamescope_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(basic, text="Run inside gamescope (experimental - known to exit early on this game)",
-                        variable=self.gamescope_var).grid(row=row, column=0, columnspan=4, sticky="w", pady=(16, 0))
+        ttk.Separator(basic, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=12)
         row += 1
-        self.gamescope_fullscreen_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(basic, text="Fullscreen (gamescope only)",
-                        variable=self.gamescope_fullscreen_var).grid(row=row, column=0, columnspan=4, sticky="w")
+        ttk.Label(basic, text="Gamescope (nested compositor)", font=("", 10, "bold")).grid(
+            row=row, column=0, columnspan=4, sticky="w")
+        row += 1
+        ttk.Label(basic, text="Windowed and fullscreen both work, FSR included. Windowed mode uses "
+                              "gamescope's SDL backend over X11 automatically (the default Wayland "
+                              "backend freezes the game after one frame in a window).",
+                  foreground="gray", wraplength=520).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 4))
+        row += 1
+        # Stored in fgo.env, not fgo-launcher.json: fgo-launcher.sh reads these
+        # FGO_GAMESCOPE_* keys from there, and fgo.env overrides the environment.
+        env_text = read_env_file()
+        self.gamescope_var = tk.BooleanVar(value=get_env_value(env_text, "FGO_GAMESCOPE") == "1")
+        ttk.Checkbutton(basic, text="Run inside gamescope", variable=self.gamescope_var,
+                        command=self._on_gamescope_toggled).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.gamescope_fullscreen_var = tk.BooleanVar(
+            value=get_env_value(env_text, "FGO_GAMESCOPE_FULLSCREEN") == "1")
+        ttk.Checkbutton(basic, text="Fullscreen",
+                        variable=self.gamescope_fullscreen_var).grid(
+            row=row, column=2, columnspan=2, sticky="w", pady=(4, 0))
+        row += 1
+
+        self.gamescope_fsr_var = tk.BooleanVar(value=get_env_value(env_text, "FGO_GAMESCOPE_FSR") == "1")
+        self.fsr_check = ttk.Checkbutton(basic, text="Upscale with AMD FSR", variable=self.gamescope_fsr_var,
+                                          command=self._on_gamescope_toggled)
+        self.fsr_check.grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Label(basic, text="Sharpness (0=sharpest, 20=softest):").grid(row=row, column=2, sticky="w")
+        row += 1
+        self.fsr_sharpness_var = tk.StringVar(value=get_env_value(env_text, "FGO_GAMESCOPE_SHARPNESS", "5") or "5")
+        self.fsr_sharpness_entry = ttk.Entry(basic, textvariable=self.fsr_sharpness_var, width=6)
+        self.fsr_sharpness_entry.grid(row=row - 1, column=3, sticky="w")
+
+        ttk.Label(basic, text="Render at (game's own resolution, above) - upscale to:").grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        row += 1
+        self.gamescope_output_width_var = tk.StringVar(value=get_env_value(env_text, "FGO_GAMESCOPE_OUTPUT_WIDTH"))
+        self.gamescope_output_height_var = tk.StringVar(value=get_env_value(env_text, "FGO_GAMESCOPE_OUTPUT_HEIGHT"))
+        self.gamescope_output_width_entry = ttk.Entry(basic, textvariable=self.gamescope_output_width_var, width=8)
+        self.gamescope_output_width_entry.grid(row=row, column=0, sticky="w")
+        ttk.Label(basic, text="x").grid(row=row, column=1)
+        self.gamescope_output_height_entry = ttk.Entry(basic, textvariable=self.gamescope_output_height_var, width=8)
+        self.gamescope_output_height_entry.grid(row=row, column=2, sticky="w")
+        ttk.Label(basic, text="(blank = same as Resolution, no upscaling)", foreground="gray").grid(
+            row=row, column=3, sticky="w")
+        row += 1
+
+        self._on_gamescope_toggled()
 
         # --- Advanced Graphics: fgo-launcher.json's own "graphics" object -
         # already fully wired through fgo-launcher.sh into FGO_* env vars the
@@ -1124,13 +1181,11 @@ class DisplayTab(ttk.Frame):
         try:
             width = int(self.width_var.get())
             height = int(self.height_var.get())
-            fps = int(self.fps_var.get())
         except ValueError:
-            raise ValueError("Resolution and target FPS must be whole numbers.")
+            raise ValueError("Resolution must be whole numbers.")
         if not (480 <= width <= 7680) or not (480 <= height <= 7680):
             raise ValueError("Resolution must be between 480 and 7680 on each side.")
-        if not (1 <= fps <= 360):
-            raise ValueError("Target FPS must be between 1 and 360.")
+        fps = dict(FPS_CHOICES)[self.fps_var.get()]
 
         def pct(var, lo, hi, label):
             try:
@@ -1149,8 +1204,38 @@ class DisplayTab(ttk.Frame):
         )
         return width, height, fps, damage
 
+    def _gamescope_env_values(self):
+        output_width = self.gamescope_output_width_var.get().strip()
+        output_height = self.gamescope_output_height_var.get().strip()
+        if bool(output_width) != bool(output_height):
+            raise ValueError("Gamescope upscale size needs both width and height, or neither.")
+        if output_width:
+            try:
+                ok = 480 <= int(output_width) <= 7680 and 480 <= int(output_height) <= 7680
+            except ValueError:
+                ok = False
+            if not ok:
+                raise ValueError("Gamescope upscale size must be whole numbers between 480 and 7680.")
+        sharpness = self.fsr_sharpness_var.get().strip() or "5"
+        try:
+            if not 0 <= int(sharpness) <= 20:
+                raise ValueError
+        except ValueError:
+            raise ValueError("FSR sharpness must be a whole number from 0 to 20.")
+        flag = lambda var: "1" if var.get() else "0"
+        return {
+            "FGO_GAMESCOPE": flag(self.gamescope_var),
+            "FGO_GAMESCOPE_FULLSCREEN": flag(self.gamescope_fullscreen_var),
+            "FGO_GAMESCOPE_FSR": flag(self.gamescope_fsr_var),
+            "FGO_GAMESCOPE_SHARPNESS": sharpness,
+            "FGO_GAMESCOPE_OUTPUT_WIDTH": output_width,
+            "FGO_GAMESCOPE_OUTPUT_HEIGHT": output_height,
+        }
+
     def save(self):
         width, height, fps, damage = self.validate()
+        gamescope_env = self._gamescope_env_values()
+        gamescope_env["FGO_UNLOCK_HIGH_FPS"] = "1" if fps > 60 else "0"
         damage_number_scale, damage_number_opacity, damage_texture_scale, damage_texture_opacity = damage
         self.config_data["resolutionWidth"] = width
         self.config_data["resolutionHeight"] = height
@@ -1191,15 +1276,16 @@ class DisplayTab(ttk.Frame):
         self.config_data["graphics"] = self.graphics_data
         save_launcher_json(self.config_data)
         save_audio_volume({key: int(round(var.get())) for key, var in self.volume_vars.items()})
+        set_env_values(gamescope_env)
 
-    def play_env(self):
-        env = {}
-        if self.gamescope_var.get():
-            env["FGO_GAMESCOPE"] = "1"
-            if self.gamescope_fullscreen_var.get():
-                env["FGO_GAMESCOPE_FULLSCREEN"] = "1"
-        return env
-
+    def _on_gamescope_toggled(self):
+        gamescope_on = self.gamescope_var.get()
+        state = "normal" if gamescope_on else "disabled"
+        self.fsr_check.configure(state=state)
+        self.gamescope_output_width_entry.configure(state=state)
+        self.gamescope_output_height_entry.configure(state=state)
+        fsr_state = "normal" if (gamescope_on and self.gamescope_fsr_var.get()) else "disabled"
+        self.fsr_sharpness_entry.configure(state=fsr_state)
 
 class ControlsTab(ttk.Frame):
     def __init__(self, parent):
@@ -1494,9 +1580,17 @@ class ServerTab(ttk.Frame):
                 ports[key] = int(var.get())
             except ValueError:
                 raise ValueError(f"{key} port must be a whole number.")
-        run_server_tool("apply", "--host", self.host_var.get().strip(),
-                         "--http", str(ports["http"]), "--billing", str(ports["billing"]),
-                         "--aime", str(ports["aime"]), "--database", str(ports["database"]))
+        host = self.host_var.get().strip()
+        # `apply` refuses while the server is running, and the main Save button
+        # saves every tab - skip it when nothing here changed, so saving e.g. audio
+        # mid-game works.
+        current = run_server_tool("show")
+        unchanged = str(current.get("host", "auto")) == host and all(
+            int(current.get(key, -1)) == value for key, value in ports.items())
+        if not unchanged:
+            run_server_tool("apply", "--host", host,
+                             "--http", str(ports["http"]), "--billing", str(ports["billing"]),
+                             "--aime", str(ports["aime"]), "--database", str(ports["database"]))
 
         db_host = self.db_host_var.get().strip()
         db_user = self.db_user_var.get().strip()
@@ -3208,10 +3302,8 @@ class App(tk.Tk):
             messagebox.showerror("Could not save", str(exc))
             return
         linux_dir = Path(__file__).resolve().parent.parent  # linux/tools -> linux
-        env = dict(os.environ)
-        env.update(self.display_tab.play_env())
         try:
-            subprocess.Popen([str(linux_dir / "fgo-launcher.sh")], env=env)
+            subprocess.Popen([str(linux_dir / "fgo-launcher.sh")])
         except Exception as exc:
             messagebox.showerror("Could not launch", str(exc))
             return
