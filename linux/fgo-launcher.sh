@@ -60,6 +60,16 @@ if [ ! -f "$gl_compat_path" ] && [ ! -f "$game_root/opengl32.dll" ] && [ -f "$in
     fgo_log "GPU compat: deployed compat/fgoglcompat.dll (Legacy layer) to App/ - fresh install had neither compat layer."
 fi
 
+# Self-heal: cards with native GL_ARB_bindless_texture support (check with
+# `glxinfo | grep bindless`) still need a Mesa driconf override on top of the
+# compat layer above, or ago.exe hits a GLSL compile error Mesa rejects by
+# default - see the root README's "GPU compatibility" section. ~/.drirc is a
+# system-wide per-user file that can hold other games' own stanzas, so this
+# only ever adds ours if missing (parses the existing XML, preserving
+# everything else byte-for-byte) - never overwrites the file, and leaves it
+# alone entirely if it isn't recognizable driconf XML.
+"$FGO_PYTHON" "$SCRIPT_DIR/tools/ensure_drirc.py" 2>&1 | while IFS= read -r drirc_line; do fgo_log "$drirc_line"; done
+
 # Self-heal: modern Wine (11.0+, the only branches this game runs on) links
 # wined3d.dll's own Vulkan backend against libvkd3d-*.dll - a real, load-time
 # dependency, not optional. A Proton build ships those PE DLLs in its own

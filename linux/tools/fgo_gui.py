@@ -328,6 +328,12 @@ def summon_weights_path():
     return install_root() / "Server" / "artemis" / "config" / "fgo_summon_weights.json"
 
 
+def summon_presets_folder():
+    # Matches scooby's own SummonSettingsWindow.PresetsFolder exactly - a
+    # sibling of the live weights file, not under App/ like deck-loadouts.
+    return summon_weights_path().parent / "summon-presets"
+
+
 def load_summon_candidates():
     """The eligible summon pool - every non-"story"-category entry in
     summon_candidates.json (confirmed to match the real weights file's own
@@ -1439,6 +1445,46 @@ class ServerTab(ttk.Frame):
         row += 1
         ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=420).grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        row += 1
+
+        ttk.Separator(self, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
+        row += 1
+        ttk.Label(self, text="Local server process (ALL.Net/billing/AimeDB) - separate from the game "
+                              "itself. fgo-launcher.sh starts it automatically before Play if configured "
+                              "to, but you can also control it here directly (e.g. to restart it after "
+                              "changing Draw Rates/Banners settings, without relaunching the game).",
+                  foreground="gray", wraplength=420).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        server_buttons = ttk.Frame(self)
+        server_buttons.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(server_buttons, text="Start Server", command=self._start_server).pack(side="left")
+        ttk.Button(server_buttons, text="Stop Server", command=self._stop_server).pack(side="left", padx=(6, 0))
+        ttk.Button(server_buttons, text="Restart Server", command=self._restart_server).pack(side="left", padx=(6, 0))
+        row += 1
+        self.server_status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.server_status_var, foreground="gray", wraplength=420).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+    def _run_server_script(self, script_name, busy_text, timeout=60):
+        script = Path(__file__).resolve().parent.parent / script_name
+        self.server_status_var.set(busy_text)
+        self.update_idletasks()
+        try:
+            result = subprocess.run([str(script)], capture_output=True, text=True, timeout=timeout)
+            tail = "\n".join((result.stdout + result.stderr).strip().splitlines()[-6:])
+            self.server_status_var.set(tail or ("Done." if result.returncode == 0 else f"Failed (exit {result.returncode})."))
+        except Exception as exc:
+            self.server_status_var.set(f"Could not run {script_name}: {exc}")
+
+    def _start_server(self):
+        self._run_server_script("start-fgo-local-server.sh", "Starting the local server...")
+
+    def _stop_server(self):
+        self._run_server_script("stop-fgo-local-server.sh", "Stopping the local server...", timeout=20)
+
+    def _restart_server(self):
+        self._run_server_script("stop-fgo-local-server.sh", "Restarting: stopping first...", timeout=20)
+        self._run_server_script("start-fgo-local-server.sh", "Restarting: starting...")
 
     def save(self):
         ports = {}
@@ -1920,6 +1966,7 @@ class DeckTab(ttk.Frame):
     PAGE_SIZE = 48
     THUMB_SIZE = (72, 111)
     LIST_THUMB_SIZE = (56, 86)
+    ICON_CELL_WIDTH = 140  # measured real cell reqwidth (name_label's width=16 dominates, not the thumbnail)
     MAX_DECK_SIZE = 30
 
     def __init__(self, parent):
@@ -2003,8 +2050,10 @@ class DeckTab(ttk.Frame):
         grid_scroll.pack(side="right", fill="y")
         self.grid_canvas.pack(side="left", fill="both", expand=True)
         self.grid_frame = ttk.Frame(self.grid_canvas)
-        self.grid_canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
+        self._grid_window = self.grid_canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
         self.grid_frame.bind("<Configure>", lambda e: self.grid_canvas.configure(scrollregion=self.grid_canvas.bbox("all")))
+        self._icon_columns = 6
+        self.grid_canvas.bind("<Configure>", self._on_grid_canvas_resize)
 
         # Scrollable, not a plain fixed-height Frame - this side panel (deck
         # status/list + Loadouts row) is tall enough that a plain pack() cuts
@@ -2193,6 +2242,20 @@ class DeckTab(ttk.Frame):
         self.page = 0
         self._render_current_page()
 
+    def _on_grid_canvas_resize(self, event):
+        # The icon grid previously hardcoded 6 columns regardless of the
+        # window's actual width, so on anything narrower than that it just
+        # clipped the rightmost column(s) at the window edge with no way to
+        # scroll to them (the canvas only scrolls vertically). Recomputed
+        # from the canvas's real width instead, same idea as scooby's own
+        # UpdateCardItemsSource (Max(1, Floor(ActualWidth / cellWidth))).
+        self.grid_canvas.itemconfigure(self._grid_window, width=event.width)
+        columns = max(1, event.width // self.ICON_CELL_WIDTH)
+        if columns != self._icon_columns:
+            self._icon_columns = columns
+            if self.view_mode.get() != "List":
+                self._render_current_page()
+
     # --- thumbnails ------------------------------------------------------
 
     def _thumbnail_cache_dir(self):
@@ -2285,7 +2348,7 @@ class DeckTab(ttk.Frame):
         return any(v["file_name"] in self.selected for v in entity["variants"])
 
     def _render_icons(self, entities):
-        columns = 6
+        columns = self._icon_columns
         for index, entity in enumerate(entities):
             card = entity["card"]
             r, c = divmod(index, columns)
@@ -2422,8 +2485,24 @@ class DeckTab(ttk.Frame):
         if not self.selected:
             if not messagebox.askyesno("Empty deck", "No cards selected - save an empty deck anyway?"):
                 return
-        relative_cards_path = os.path.relpath(self.cards_path, install_root() / "App").replace("/", "\\")
-        selected_cards = [f"{relative_cards_path}\\{entry['card']['file_name']}" for entry in self.selected.values()]
+        # Forward slashes, not backslashes - Win32 (and so Wine) accepts "/"
+        # in a path everywhere, but the ARTEMIS server itself is native Linux
+        # Python: its own _load_card_catalog() does os.path.join/isabs on
+        # this exact same CardsPath string, and on POSIX a backslash is just
+        # an ordinary filename character, not a separator - a "..\DEVICE\..."
+        # value resolves to one bogus nonexistent path component. That silently
+        # empties the server's whole Servant catalog (caught by a bare
+        # try/except there), so it can never recognize ANY Servant tc_id -
+        # while Craft Essences still work, since their validation path reads
+        # a fixed master file that doesn't go through CardsPath at all. Confirmed
+        # 2026-09-29: this is exactly the "no Servants in Formation, only CEs"
+        # bug - it doesn't need the server running to reproduce, this key
+        # is just plain unparsable Linux-side no matter when it's read. Also
+        # affects scooby.exe's own writes here (C#'s Path.GetRelativePath()
+        # emits backslashes too when run under Wine), so this isn't
+        # something specific to this tool's output.
+        relative_cards_path = os.path.relpath(self.cards_path, install_root() / "App").replace(os.sep, "/")
+        selected_cards = [f"{relative_cards_path}/{entry['card']['file_name']}" for entry in self.selected.values()]
         selected_copies = [entry["qty"].get() for entry in self.selected.values()]
         deck_json_path().write_text(json.dumps({
             "SelectedCards": selected_cards,
@@ -2588,9 +2667,7 @@ class DrawRatesTab(ttk.Frame):
     something this tab is hiding). Not a retail probability table, and not
     scooby's own UI at all - scooby has no Draw Rates view of its own; this
     reads/writes the same server config file directly. Requires restarting
-    the local server (linux/stop-fgo-local-server.sh then
-    start-fgo-local-server.sh - this GUI doesn't start/stop it itself) to
-    take effect."""
+    the local server (Server tab's Restart Server button) to take effect."""
 
     PAGE_SIZE = 40
     THUMB_SIZE = (56, 86)
@@ -2612,8 +2689,8 @@ class DrawRatesTab(ttk.Frame):
 
         ttk.Label(self, text="Local simulation weights, not a retail probability table. A weight of 0 removes "
                               "a card from the pool entirely; equal nonzero weights split evenly. Restart the "
-                              "local server (stop-fgo-local-server.sh, then start-fgo-local-server.sh - this "
-                              "GUI doesn't start/stop it itself) after saving for changes to take effect.",
+                              "local server (Server tab's Restart Server button) after saving for changes to "
+                              "take effect.",
                   foreground="gray", wraplength=780).pack(anchor="w", pady=(0, 8))
 
         toolbar = ttk.Frame(self)
@@ -2669,12 +2746,34 @@ class DrawRatesTab(ttk.Frame):
         self.status_var = tk.StringVar(value="")
         ttk.Label(bottom, textvariable=self.status_var, foreground="gray").pack(side="left", padx=(12, 0))
 
+        # Presets - a named rate table you can switch between, share, or keep
+        # as a starting point (e.g. "everyone equal" vs "only my favorites")
+        # - separate from the single live weights file Save Weights writes.
+        # Matches scooby's own SummonSettingsWindow Presets row exactly (same
+        # file format, same folder), so a preset saved by either tool loads
+        # in the other.
+        presets_row = ttk.Frame(self)
+        presets_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(presets_row, text="Presets:").pack(side="left")
+        self.preset_var = tk.StringVar()
+        self.preset_combo = ttk.Combobox(presets_row, textvariable=self.preset_var, state="readonly", width=24)
+        self.preset_combo.pack(side="left", padx=(4, 8))
+        ttk.Button(presets_row, text="Save as", command=self._preset_save).pack(side="left")
+        ttk.Button(presets_row, text="Load", command=self._preset_load).pack(side="left", padx=(4, 0))
+        ttk.Button(presets_row, text="Delete", command=self._preset_delete).pack(side="left", padx=(4, 0))
+        ttk.Button(presets_row, text="Export", command=self._preset_export).pack(side="left", padx=(12, 0))
+        ttk.Button(presets_row, text="Import", command=self._preset_import).pack(side="left", padx=(4, 0))
+        preset_folder_link = ttk.Label(presets_row, text="Open folder", foreground="#3d8fd6", cursor="hand2")
+        preset_folder_link.pack(side="left", padx=(12, 0))
+        preset_folder_link.bind("<Button-1>", lambda e: self._preset_open_folder())
+
         self.reload()
 
     def reload(self):
         self.cards = load_summon_candidates()
         eligible_ids = {c["tc_id"] for c in self.cards}
         self.weights = load_summon_weights(eligible_ids)
+        self._refresh_presets()
         self._apply_filter()
 
     def _apply_filter(self):
@@ -2796,8 +2895,145 @@ class DrawRatesTab(ttk.Frame):
         except ValueError as exc:
             self.status_var.set(str(exc))
             return
-        self.status_var.set("Saved. Restart the local server (stop-fgo-local-server.sh, then "
-                             "start-fgo-local-server.sh) for changes to take effect.")
+        self.status_var.set("Saved. Restart the local server (Server tab's Restart Server button) "
+                             "for changes to take effect.")
+
+    # --- presets (Server/artemis/config/summon-presets/<name>.json) --------
+    # Same {"version": 1, "weights": {...}} shape as the live weights file
+    # itself (scooby's own BuildWeightsJson() - a preset IS just a saved
+    # copy of that file), so a preset either tool saves loads in the other.
+
+    def _refresh_presets(self, select=None):
+        folder = summon_presets_folder()
+        names = sorted(p.stem for p in folder.glob("*.json")) if folder.is_dir() else []
+        self.preset_combo["values"] = names
+        if select is not None and select in names:
+            self.preset_var.set(select)
+        elif self.preset_var.get() not in names:
+            self.preset_var.set("")
+
+    @staticmethod
+    def _looks_like_preset(data):
+        return isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("weights"), dict)
+
+    def _preset_save(self):
+        for tc_id, var in self.weight_vars.items():
+            self._commit_weight(tc_id, var)
+        name = simpledialog.askstring("Save preset", "Name for this rate table:",
+                                       initialvalue=self.preset_var.get(), parent=self.winfo_toplevel())
+        if not name:
+            return
+        folder = summon_presets_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"{name}.json"
+        if target.exists() and not messagebox.askyesno("Save preset", f'Replace the preset "{name}"?'):
+            return
+        payload = {"version": 1, "weights": {str(tc_id): int(w) for tc_id, w in sorted(self.weights.items())}}
+        try:
+            target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.status_var.set(f"The preset could not be saved: {exc}")
+            return
+        self._refresh_presets(select=name)
+        self.status_var.set(f"Preset saved: {name}. The live rates are unchanged until you click "
+                             "Save Weights. Export sends a copy to share.")
+
+    def _apply_preset_file(self, path, name):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.status_var.set("That file is not a draw-rate preset.")
+            return
+        if not self._looks_like_preset(data):
+            self.status_var.set("That file is not a draw-rate preset.")
+            return
+        eligible_ids = {c["tc_id"] for c in self.cards}
+        skipped = 0
+        for key, value in data["weights"].items():
+            try:
+                tc_id = int(key)
+                weight = max(0, min(MAX_SUMMON_WEIGHT, int(value)))
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+            if tc_id not in eligible_ids:
+                skipped += 1
+                continue
+            self.weights[tc_id] = weight
+        self._render_page()
+        suffix = (f" ({skipped} card(s) in the file are not in your game and were left out)"
+                  if skipped else "")
+        self.status_var.set(f"Preset loaded: {name}{suffix}. Click Save Weights to make the server use it.")
+
+    def _preset_load(self):
+        name = self.preset_var.get()
+        if not name:
+            return
+        self._apply_preset_file(summon_presets_folder() / f"{name}.json", name)
+
+    def _preset_delete(self):
+        name = self.preset_var.get()
+        if not name:
+            return
+        if not messagebox.askyesno("Delete preset", f'Delete the preset "{name}"?'):
+            return
+        (summon_presets_folder() / f"{name}.json").unlink(missing_ok=True)
+        self._refresh_presets()
+        self.status_var.set(f"Preset deleted: {name}")
+
+    def _preset_export(self):
+        name = self.preset_var.get()
+        if not name:
+            self.status_var.set("Select a preset to export, or Save as first.")
+            return
+        source = summon_presets_folder() / f"{name}.json"
+        desktop = Path.home() / "Desktop"
+        dest = filedialog.asksaveasfilename(
+            title="Export preset", initialfile=f"{name}.json", defaultextension=".json",
+            initialdir=str(desktop if desktop.is_dir() else Path.home()), filetypes=[("Draw-rate preset", "*.json")])
+        if not dest:
+            return
+        try:
+            shutil.copyfile(source, dest)
+        except OSError as exc:
+            self.status_var.set(f"The preset could not be exported: {exc}")
+            return
+        self.status_var.set(f"Exported: {Path(dest).name} - send it to anyone with the launcher; "
+                             "they add it with Import.")
+
+    def _preset_import(self):
+        source = filedialog.askopenfilename(title="Import preset", filetypes=[("Draw-rate preset", "*.json")])
+        if not source:
+            return
+        try:
+            data = json.loads(Path(source).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            messagebox.showerror("Import", "That file is not a draw-rate preset. Pick a .json file that "
+                                            "was exported from the Presets row.")
+            return
+        if not self._looks_like_preset(data):
+            messagebox.showerror("Import", "That file is not a draw-rate preset. Pick a .json file that "
+                                            "was exported from the Presets row.")
+            return
+        name = Path(source).stem
+        folder = summon_presets_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"{name}.json"
+        try:
+            shutil.copyfile(source, target)
+        except OSError as exc:
+            self.status_var.set(f"The preset could not be imported: {exc}")
+            return
+        self._refresh_presets(select=name)
+        self._apply_preset_file(target, name)
+
+    def _preset_open_folder(self):
+        folder = summon_presets_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.Popen(["xdg-open", str(folder)])
+        except OSError:
+            messagebox.showinfo("Open folder", str(folder))
 
 
 class BannersTab(ttk.Frame):
@@ -2826,8 +3062,7 @@ class BannersTab(ttk.Frame):
 
         ttk.Label(self, text="Checking one or more events below hides every OTHER event's story nodes/menus "
                               "in-game. Checking none shows everything (no filter). Restart the local server "
-                              "(stop-fgo-local-server.sh, then start-fgo-local-server.sh - this GUI doesn't "
-                              "start/stop it itself) after Save for this to take effect.",
+                              "(Server tab's Restart Server button) after Save for this to take effect.",
                   foreground="gray", wraplength=760).pack(anchor="w", pady=(0, 10))
 
         actions = ttk.Frame(self)
@@ -2882,8 +3117,7 @@ class BannersTab(ttk.Frame):
         except Exception as exc:
             self.status_var.set(f"Could not save: {exc}")
             return
-        restart_hint = ("Restart the local server (stop-fgo-local-server.sh, then "
-                         "start-fgo-local-server.sh) for this to take effect.")
+        restart_hint = "Restart the local server (Server tab's Restart Server button) for this to take effect."
         if ids:
             self.status_var.set(f"Saved - {len(ids)} event(s) allowed, everything else hidden. {restart_hint}")
         else:
