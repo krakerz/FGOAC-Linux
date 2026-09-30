@@ -22,13 +22,18 @@ def read_env_file(path=None):
 
 def get_env_value(text, key, default=""):
     match = re.search(r'(?m)^' + re.escape(key) + r'="(.*)"\s*$', text)
-    return match.group(1) if match else default
+    if not match:
+        return default
+    # Undo set_env_value's escaping (\\ and \"), as bash does when it sources the file.
+    return re.sub(r'\\(["\\$`])', r"\1", match.group(1))
 
 
 def set_env_value(text, key, value):
     """Mirrors setup.sh's set_env_value: replace an active KEY="...", else an
     inactive #KEY="...", else append a new line."""
-    escaped = value.replace("\\", r"\\").replace('"', r"\"")
+    # $ and ` too: fgo.env is sourced by bash inside double quotes, which would
+    # otherwise expand e.g. LD_PRELOAD=/usr/$LIB/... before anything sees it.
+    escaped = re.sub(r'(["\\$`])', r"\\\1", value)
     line = f'{key}="{escaped}"'
     active = re.compile(r'(?m)^' + re.escape(key) + r'=.*$')
     if active.search(text):

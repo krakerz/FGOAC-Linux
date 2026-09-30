@@ -1252,6 +1252,22 @@ class DisplayTab(ttk.Frame):
                   foreground="gray", wraplength=520).grid(row=row, column=0, columnspan=4, sticky="w")
         row += 1
 
+        ttk.Label(basic, text="Launch environment:", width=18).grid(row=row, column=0, sticky="w", pady=(10, 3))
+        self.extra_env_var = tk.StringVar(value=get_env_value(read_env_file(), "FGO_EXTRA_ENV"))
+        ttk.Entry(basic, textvariable=self.extra_env_var, width=52).grid(
+            row=row, column=1, columnspan=3, sticky="w", pady=(10, 3))
+        row += 1
+        ttk.Label(basic, text="Extra NAME=value pairs for the game, separated by spaces (quote values with "
+                              "spaces), e.g. DXVK_HUD=fps. Applies on the next launch.",
+                  foreground="gray", wraplength=520).grid(row=row, column=0, columnspan=4, sticky="w")
+        row += 1
+        have_mangohud = shutil.which("mangohud") is not None
+        self.mangohud_var = tk.BooleanVar(value=get_env_value(read_env_file(), "FGO_MANGOHUD") == "1")
+        ttk.Checkbutton(basic, text="MangoHud overlay" + ("" if have_mangohud else " (mangohud is not installed)"),
+                        variable=self.mangohud_var, state="normal" if have_mangohud else "disabled").grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        row += 1
+
         ttk.Separator(basic, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=12)
         row += 1
         ttk.Label(basic, text="Gamescope (nested compositor)", font=("", 10, "bold")).grid(
@@ -1588,8 +1604,18 @@ class DisplayTab(ttk.Frame):
                 raise ValueError
         except ValueError:
             raise ValueError("FSR sharpness must be a whole number from 0 to 20.")
+        extra_env = self.extra_env_var.get().strip()
+        try:
+            tokens = shlex.split(extra_env)
+        except ValueError as exc:
+            raise ValueError(f"Launch environment: {exc}.")
+        bad = [token for token in tokens if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token, re.S)]
+        if bad:
+            raise ValueError(f"Launch environment: {bad[0]!r} isn't NAME=value (e.g. MANGOHUD=1).")
         flag = lambda var: "1" if var.get() else "0"
         return {
+            "FGO_EXTRA_ENV": extra_env,
+            "FGO_MANGOHUD": flag(self.mangohud_var),
             "FGO_GAMESCOPE": flag(self.gamescope_var),
             "FGO_GAMESCOPE_FULLSCREEN": flag(self.gamescope_fullscreen_var),
             "FGO_GAMESCOPE_FSR": flag(self.gamescope_fsr_var),
