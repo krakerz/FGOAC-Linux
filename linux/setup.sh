@@ -67,27 +67,30 @@ if [ -n "$current_install_root" ] && [ -f "$current_install_root/Server/artemis/
 fi
 
 echo "Installing Python dependencies into $VENV_DIR ..."
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
+# One plain line per step (no --quiet, no redrawn progress bar), so a long
+# first install visibly progresses - in a terminal and in the GUI's Output box.
+pip_install() { "$VENV_DIR/bin/pip" install --disable-pip-version-check --progress-bar off "$@"; }
+pip_install --upgrade pip
 if [ -n "$requirements" ]; then
     # pylibmc needs libmemcached's C headers, which most systems don't have
     # installed, and is only used when core.yaml's enable_memcached is true
     # (try-imported, degrades gracefully otherwise - confirmed 2026-09-17).
     grep -v '^pylibmc' "$requirements" > "$SCRIPT_DIR/.requirements-filtered.txt"
-    "$VENV_DIR/bin/pip" install --quiet -r "$SCRIPT_DIR/.requirements-filtered.txt"
+    pip_install -r "$SCRIPT_DIR/.requirements-filtered.txt"
     rm -f "$SCRIPT_DIR/.requirements-filtered.txt"
 else
     echo "Warning: Server/artemis/requirements.txt not found (set FGO_INSTALL_ROOT in $ENV_FILE first for the exact pinned versions) - installing a known-good minimal set instead." >&2
-    "$VENV_DIR/bin/pip" install --quiet pyyaml "sqlalchemy==1.4.46" aiomysql "starlette==0.52.1" uvicorn pycryptodome coloredlogs
+    pip_install pyyaml "sqlalchemy==1.4.46" aiomysql "starlette==0.52.1" uvicorn pycryptodome coloredlogs
 fi
 # Needed by the fgo title module but missing from artemis's own
 # requirements.txt (confirmed 2026-09-17) - always ensure it's present.
-"$VENV_DIR/bin/pip" install --quiet msgpack
+pip_install msgpack
 # aiomysql (unpinned in requirements.txt) breaks against current PyMySQL:
 # aiomysql imports converters.escape_dict/escape_sequence/escape_string,
 # which PyMySQL 1.1+ removed. Confirmed working pair: aiomysql 0.3.2 +
 # PyMySQL 1.0.x (confirmed 2026-09-17). Pin after the main install so this
 # always wins regardless of what pip's resolver picked above.
-"$VENV_DIR/bin/pip" install --quiet "PyMySQL<1.1"
+pip_install "PyMySQL<1.1"
 
 set_env_value FGO_PYTHON "$VENV_DIR/bin/python"
 

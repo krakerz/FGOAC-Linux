@@ -1040,7 +1040,8 @@ class SetupTab(ttk.Frame):
         ttk.Label(side, textvariable=self.venv_status_var).pack(anchor="w", pady=(4, 0))
         ttk.Label(side, text="The local server's Python packages. Run once on a new setup, and again after "
                              "updating this project.", foreground="gray", wraplength=280).pack(anchor="w")
-        ttk.Button(side, text="Set up / update", command=self._run_setup).pack(anchor="w", pady=(6, 0))
+        self.setup_button = ttk.Button(side, text="Set up / update", command=self._run_setup)
+        self.setup_button.pack(anchor="w", pady=(6, 0))
         self.setup_status_var = tk.StringVar(value="")
 
     def _browse_dir(self, var):
@@ -1097,15 +1098,60 @@ class SetupTab(ttk.Frame):
         wine = self._resolved_wine()
         if wine:
             args += ["--wine", wine]
-        self.setup_status_var.set("Running setup.sh...")
-        self.update_idletasks()
+        # Runs in the background and streams into the Output box: a first
+        # install downloads every package and takes minutes, and a frozen
+        # window with no output looked like nothing was happening.
+        header = ("Setting up the Python environment - the first run downloads and installs the server's "
+                  "packages and can take a few minutes.")
         try:
-            result = subprocess.run(args, capture_output=True, text=True, timeout=300)
-            tail = "\n".join((result.stdout + result.stderr).strip().splitlines()[-5:])
-            self.setup_status_var.set(tail or "Done.")
-        except Exception as exc:
+            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                       bufsize=1)
+        except OSError as exc:
             self.setup_status_var.set(f"Could not run setup.sh: {exc}")
             return
+        self.setup_button.state(["disabled"])
+        app = self.winfo_toplevel()
+        if hasattr(app, "output_busy"):
+            app.output_busy(self, True)
+        self.setup_status_var.set(header)
+        lines = queue.Queue()
+
+        def read_output():
+            for line in process.stdout:
+                lines.put(line.rstrip())
+            lines.put(None)
+
+        threading.Thread(target=read_output, daemon=True).start()
+        output = []
+
+        def poll():
+            finished = False
+            while True:
+                try:
+                    line = lines.get_nowait()
+                except queue.Empty:
+                    break
+                if line is None:
+                    finished = True
+                    break
+                if line.strip():
+                    output.append(line)
+            if not finished:
+                if output:
+                    self.setup_status_var.set(header + "\n" + "\n".join(output[-60:]))
+                self.after(150, poll)
+                return
+            code = process.wait()
+            summary = "\n".join(output[-60:]) or "Done."
+            self.setup_status_var.set(summary if code == 0 else f"{summary}\nsetup.sh failed (exit {code}).")
+            self.setup_button.state(["!disabled"])
+            if hasattr(app, "output_busy"):
+                app.output_busy(self, False)
+            self._after_setup()
+
+        self.after(150, poll)
+
+    def _after_setup(self):
         # setup.sh wrote FGO_PYTHON into fgo.env; this process started before
         # the venv existed, so pick it up here or the server tools run with
         # the system python (no pymysql/yaml).
@@ -4539,13 +4585,15 @@ class App(tk.Tk):
                                    background=ttk.Style().lookup("TFrame", "background") or "#d9d9d9")
         output_scroll = ttk.Scrollbar(self.output_frame, orient="vertical", command=self.output_text.yview)
         self.output_text.configure(yscrollcommand=output_scroll.set, state="disabled")
+        self._busy_tabs = set()
+        self.output_progress = ttk.Progressbar(self.output_frame, mode="indeterminate")
         output_scroll.pack(side="right", fill="y")
         self.output_text.pack(side="left", fill="both", expand=True)
         self.output_frame.bind("<Enter>", lambda _event: self._cancel_output_hide())
         self.output_frame.bind("<Leave>", lambda _event: self._schedule_output_hide())
 
         self.notebook = ttk.Notebook(self)
-        self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self._hide_output())
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self._on_tab_changed())
 
         self.setup_tab = SetupTab(self.notebook, on_saved=self._on_setup_saved)
         self.notebook.add(self.setup_tab, text="Setup")
@@ -4608,12 +4656,40 @@ class App(tk.Tk):
         self.output_text.delete("1.0", "end")
         self.output_text.insert("1.0", text)
         self.output_text.configure(state="disabled")
+        self.output_text.see("end")
         if not self.output_frame.winfo_ismapped():
             self.output_frame.pack(side="bottom", fill="x", padx=8, pady=(6, 0), before=self.notebook)
-        self._schedule_output_hide()
+        if self.notebook.select() in self._busy_tabs:
+            self._cancel_output_hide()  # stays up until the running job ends
+        else:
+            self._schedule_output_hide()
+
+    def output_busy(self, tab, busy):
+        """A tab's long-running job started/finished: the Output box stays
+        open with a moving progress bar while it runs."""
+        (self._busy_tabs.add if busy else self._busy_tabs.discard)(str(tab))
+        self._update_busy_ui()
+
+    def _update_busy_ui(self):
+        if self.notebook.select() in self._busy_tabs:
+            if not self.output_progress.winfo_ismapped():
+                self.output_progress.pack(side="top", fill="x", pady=(0, 4), before=self.output_text)
+                self.output_progress.start(12)
+            self._show_output()
+        elif self.output_progress.winfo_ismapped():
+            self.output_progress.stop()
+            self.output_progress.pack_forget()
+            if self.output_frame.winfo_ismapped():
+                self._schedule_output_hide()
+
+    def _on_tab_changed(self):
+        self._hide_output()
+        self._update_busy_ui()  # coming back to a tab whose job still runs shows it again
 
     def _schedule_output_hide(self):
         self._cancel_output_hide()
+        if self.notebook.select() in self._busy_tabs:
+            return
         self._output_hide_job = self.after(self.OUTPUT_HIDE_MS, self._hide_output)
 
     def _cancel_output_hide(self):
