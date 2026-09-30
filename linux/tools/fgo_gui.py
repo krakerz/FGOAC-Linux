@@ -917,7 +917,7 @@ class SetupTab(ttk.Frame):
 
         ttk.Separator(self, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
         row += 1
-        ttk.Button(self, text="Save environment settings", command=self.save).grid(row=row, column=0, sticky="w")
+        ttk.Button(self, text="Save environment settings", command=self._save_clicked).grid(row=row, column=0, sticky="w")
         self.status_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=460).grid(
             row=row, column=1, columnspan=2, sticky="w")
@@ -985,14 +985,31 @@ class SetupTab(ttk.Frame):
         except Exception as exc:
             self.setup_status_var.set(f"Could not run setup.sh: {exc}")
 
+    def _save_clicked(self):
+        try:
+            self.save()
+        except ValueError as exc:
+            messagebox.showerror("Could not save", str(exc))
+
     def save(self):
-        set_env_values({
-            "FGO_INSTALL_ROOT": self.install_root_var.get().strip() or None,
+        install_root_value = self.install_root_var.get().strip()
+        if install_root_value and not is_valid_install(install_root_value):
+            raise ValueError(f"{install_root_value} doesn't look like an FGO Arcade install "
+                             "(App/fgo-launcher.json or Server/ is missing). Pick the folder that holds "
+                             "App/ and Server/.")
+        wine = self._resolved_wine()
+        if wine and not (Path(wine).is_file() or shutil.which(wine)):
+            raise ValueError(f"The Wine binary {wine} was not found.")
+        values = {
+            "FGO_INSTALL_ROOT": install_root_value or None,
             "WINEPREFIX": self.wineprefix_var.get().strip() or None,
-            "FGO_WINE": self._resolved_wine() or None,
+            "FGO_WINE": wine or None,
             "FGO_PACKAGE_ROOT": self.package_root_var.get().strip() or None,
-        })
-        self.status_var.set(f"Saved to {env_file_path()}. Restart this app for a new install root to take effect.")
+        }
+        set_env_values(values)
+        # This process's own view, so the other tabs can load right away.
+        os.environ.update({key: value for key, value in values.items() if value})
+        self.status_var.set(f"Saved to {env_file_path()}.")
         if self.on_saved:
             self.on_saved()
 
@@ -2487,6 +2504,18 @@ class ServerTab(ttk.Frame):
             ttk.Entry(self, textvariable=var, width=22, show=show).grid(row=row, column=1, sticky="w")
             row += 1
 
+        db_buttons = ttk.Frame(self)
+        db_buttons.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(db_buttons, text="Check DB connection", command=self._check_db).pack(side="left")
+        self.init_db_button = ttk.Button(db_buttons, text="Init DB", command=self._init_db, state="disabled")
+        self.init_db_button.pack(side="left", padx=(6, 0))
+        row += 1
+        self.db_status_var = tk.StringVar(value="Check the connection first; Init DB unlocks only for a "
+                                                "database without the game's tables.")
+        ttk.Label(self, textvariable=self.db_status_var, foreground="gray", wraplength=420).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        row += 1
+
         ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=420).grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
@@ -2555,6 +2584,65 @@ class ServerTab(ttk.Frame):
             self.server_status_var.set(tail or ("Done." if result.returncode == 0 else f"Failed (exit {result.returncode})."))
         except Exception as exc:
             self.server_status_var.set(f"Could not run {script_name}: {exc}")
+
+    def _run_db_tool(self, action, *extra, timeout=30):
+        """Runs fgo_db.py with the fields as typed (blank = core.yaml's value),
+        so a connection can be tested before Save."""
+        command = [fgo_python(), str(Path(__file__).resolve().parent / "fgo_db.py"), action,
+                   "--core", str(install_root() / "Server" / "artemis" / "config" / "core.yaml"), *extra]
+        for option, var in (("--host", self.db_host_var), ("--user", self.db_user_var),
+                            ("--name", self.db_name_var), ("--port", self.database_var)):
+            if var.get().strip():
+                command += [option, var.get().strip()]
+        env = dict(os.environ)
+        if self.db_password_var.get():
+            env["FGO_DB_PASSWORD"] = self.db_password_var.get()
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=env)
+
+    def _check_db(self):
+        self.db_status_var.set("Connecting...")
+        self.init_db_button.configure(state="disabled")
+        self.update_idletasks()
+        try:
+            result = self._run_db_tool("status")
+            state = json.loads(result.stdout.strip().splitlines()[-1])
+        except Exception as exc:
+            self.db_status_var.set(f"Could not run the check: {exc}")
+            return
+        if not state["ok"]:
+            self.db_status_var.set(f"Connection failed: {state['error']} (a local database only runs "
+                                   "while the server is started)")
+        elif state["initialized"]:
+            self.db_status_var.set(f"Connected - the game's tables are there ({state['tables']} tables). "
+                                   "Nothing to initialise.")
+        else:
+            detail = state["error"] or "The database has no game tables yet."
+            self.db_status_var.set(f"Connected - {detail} Init DB will create them.")
+            self.init_db_button.configure(state="normal")
+
+    def _init_db(self):
+        backups = sorted((Path(__file__).resolve().parent.parent / "backups").glob("*.sql"),
+                         key=lambda path: path.stat().st_mtime)
+        sql_path = str(backups[-1]) if backups else filedialog.askopenfilename(
+            title="Database dump to import", filetypes=[("SQL dump", "*.sql"), ("All files", "*")])
+        if not sql_path:
+            return
+        if not messagebox.askyesno("Init DB", f"Import {Path(sql_path).name} into this database?\n\n"
+                                              "It creates the game's tables (and the database itself if "
+                                              "it doesn't exist yet)."):
+            return
+        self.db_status_var.set("Importing...")
+        self.update_idletasks()
+        try:
+            result = self._run_db_tool("init", "--sql", sql_path, timeout=300)
+        except Exception as exc:
+            self.db_status_var.set(f"Init failed: {exc}")
+            return
+        if result.returncode != 0:
+            self.db_status_var.set(f"Init failed: {(result.stderr or result.stdout).strip().splitlines()[-1]}")
+            return
+        self._check_db()
+        self.db_status_var.set(f"{result.stdout.strip()} {self.db_status_var.get()}")
 
     def _start_server(self):
         self._run_server_script("start-fgo-local-server.sh", "Starting the local server...")
@@ -4241,11 +4329,12 @@ class App(tk.Tk):
         if root is not None:
             self._build_install_tabs()
         else:
-            placeholder = ttk.Frame(self.notebook, padding=24)
-            ttk.Label(placeholder, text="No FGO Arcade install configured yet.\n"
-                                         "Fill in the Setup tab, click Save, then restart this app.",
+            self.placeholder = ttk.Frame(self.notebook, padding=24)
+            ttk.Label(self.placeholder, text="No FGO Arcade install configured yet.\n"
+                                              "Fill in the Setup tab and click Save - the other tabs "
+                                              "appear once the folders check out.",
                       justify="center").pack(expand=True)
-            self.notebook.add(placeholder, text="(configure Setup first)")
+            self.notebook.add(self.placeholder, text="(configure Setup first)")
 
         # Packed (and its side="bottom" set) before the notebook, so it
         # always keeps its space at the bottom of the window regardless of
@@ -4283,8 +4372,17 @@ class App(tk.Tk):
         self.notebook.add(self.banners_tab, text="Banners")
 
     def _on_setup_saved(self):
-        if install_root_or_none() is not None and self.display_tab is None:
-            messagebox.showinfo("Restart needed", "Install root configured - restart this app to load its settings.")
+        root = install_root_or_none()
+        if root is None:
+            return
+        if self.display_tab is None:
+            self.notebook.forget(self.placeholder)
+            self.placeholder.destroy()
+            self._build_install_tabs()
+            self.title(f"FGO Arcade settings - {root}")
+        elif not self.title().endswith(str(root)):
+            messagebox.showinfo("Restart needed", "Install root changed - restart this app to load the new "
+                                                  "install's settings.")
 
     def _save_all(self):
         if self.display_tab is None:
@@ -4294,10 +4392,12 @@ class App(tk.Tk):
         self.server_tab.save()
 
     def on_save(self):
+        first_setup = self.display_tab is None
         try:
             self.setup_tab.save()
             self._save_all()
-            self.status_var.set("Saved.")
+            self.status_var.set("Setup saved - next, open the Server tab."
+                                if first_setup and self.display_tab is not None else "Saved.")
         except Exception as exc:
             messagebox.showerror("Could not save", str(exc))
 
@@ -4308,7 +4408,7 @@ class App(tk.Tk):
 
     def on_play(self):
         if self.display_tab is None:
-            messagebox.showerror("Not configured", "Configure and save the Setup tab, then restart, before playing.")
+            messagebox.showerror("Not configured", "Configure and save the Setup tab before playing.")
             return
         try:
             self._save_all()

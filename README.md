@@ -8,13 +8,14 @@ The distribution's PowerShell scripts use Windows-only subsystems (WMI, Service 
 
 ## Features
 
-- Native settings GUI (`./fgo-gui.sh`) with tabs: Setup, Game Settings (Basic / Advanced Graphics / Audio), Controls (Keyboard / Controller XInput with live button capture), Server (start/stop/restart), Account, Deck (card-art grid, deck builder), Draw Rates (with presets), Banners. Reads/writes the same files scooby does, so both stay interchangeable.
+- Native settings GUI (`./fgo-gui.sh`) with tabs: Setup, Game Settings (Basic / Advanced Graphics / Audio), Controls (Keyboard / Controller XInput with live button capture), Server (start/stop/restart, database check and init, billing report time), Account, Deck (card-art grid, deck builder), Draw Rates (with presets), Banners. Reads/writes the same files scooby does, so both stay interchangeable.
 - One-click launch: starts the local ARTEMiS server automatically and stops it when the game exits.
 - Optional gamescope: windowed or fullscreen, optional AMD FSR upscaling.
 - Graphics: render scale up to 200% (supersampling against jagged edges), SMAA, anisotropic filtering, shadow resolution.
 - Target FPS 60, or 120 (experimental - uses a one-byte-patched copy of fgohook.dll, the original stays untouched; higher GPU load, menus/touch may misbehave).
 - "Live log in a terminal" option: opens your terminal with the game's log in real time (handy when the GUI is started by double-click).
 - Self-healing on every launch: GPU compatibility (Mesa driconf entry in `~/.drirc`, missing DLLs), shader cache kept outside the install so reinstalls don't recompile shaders.
+- Shader cache can be cleared from Game Settings -> Advanced Graphics.
 - English text patch apply/revert.
 - Photo mode (built into the game's hook): F9 enter/exit, WASD move, Q/E down/up, arrow keys turn/look, Z/C roll, R reset camera, F10 hide UI. Keys are rebindable in Game Settings > Photo Mode, and its live panel adjusts FOV, move speed and depth of field while you shoot.
 
@@ -44,7 +45,12 @@ Nothing to build for normal use; the Wine helpers in `linux/shims/` (shim DLLs a
 ./fgo-gui.sh
 ```
 
-Configure the Setup tab once, then Save & Play.
+First-time setup:
+
+1. **Setup tab** - set the folders: Install root (the folder holding `App/` and `Server/`), Wine prefix, and the Wine / Proton build. Click **Set up / update** if the Python environment says "not created yet". Optionally point the EN-patch payload folder at the English patch and click **Apply EN Patch**.
+2. **Save** - if the folders check out, the other tabs appear right away; if not, an error says what's wrong (fix it, or quit).
+3. **Server tab** - set the host and ports. For a remote MariaDB, fill in its host, username, password and database name, then click **Check DB connection**. If the database is empty, **Init DB** unlocks: it imports the newest dump in `linux/backups/` - the bundled `artemis-init.sql` (empty game schema plus the default user), or a newer backup of your own - and asks for a `.sql` file if there is none and greys out again once the game's tables exist. Also set **Daily report time** to an hour you're unlikely to play (for example 02:00): the game can't boot during the hour before it (see the FAQ). Click **Save**.
+4. **Ready to play** - adjust Game Settings / Controls if you like, then **Save & Play**. The first launch compiles shaders, so it loads slower once.
 
 Without the GUI:
 ```sh
@@ -60,6 +66,12 @@ Every setting is documented in `linux/fgo.env.example`.
 
 **"Communication error" after scanning the card?**
 The local server must be running (Save & Play starts it). If it persists, your account data may have been replaced; older copies are kept as `Server/state/fgo-players.json.bak-*` in the install.
+
+**Stuck at "ALL.Net : WAIT (A, BUSY)" / "TIME STOP" on the startup screen?**
+The game was started within about an hour before its daily billing report time (07:00 by default). Restart it after that time, and move the time to an hour you don't play (Server tab -> Daily report time).
+
+**"SATELLITE:SUB" on the startup screen, Location Server WAIT, or ERROR 8404?**
+The game's Startup Mode got saved as Sub Unit. Press F1 for the Game Test Menu (F2 moves, F1 confirms), open Game Settings, set Startup Mode to Main Unit, then Exit and Exit (Reboot).
 
 **Low FPS, heavy GPU load, or lip-sync out of sync?**
 Check that your GPU isn't pinned to a low power/clock profile (for example a LACT or power-saving profile). A healthy session holds 60 FPS with modest GPU load.
