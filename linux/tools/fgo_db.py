@@ -58,10 +58,10 @@ def status(cfg):
         if code == 1049:  # unknown database: the server answered, init can create it
             return {"ok": True, "error": f"Database '{cfg['name']}' does not exist yet.",
                     "initialized": False, "tables": 0}
-        return {"ok": False, "error": str(error.args[-1] if error.args else error),
+        return {"ok": False, "error": f"{cfg['host']}:{cfg['port']} - {error.args[-1] if error.args else error}",
                 "initialized": False, "tables": 0}
     except Exception as error:  # noqa: BLE001 - reported to the GUI as text
-        return {"ok": False, "error": str(error), "initialized": False, "tables": 0}
+        return {"ok": False, "error": f"{cfg['host']}:{cfg['port']} - {error}", "initialized": False, "tables": 0}
     with connection:
         tables, initialized = table_count(connection, cfg["name"])
     return {"ok": True, "error": "", "initialized": initialized, "tables": tables}

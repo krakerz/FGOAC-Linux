@@ -289,7 +289,14 @@ def set_core_database_path():
 
 
 def fgo_python():
-    return os.environ.get("FGO_PYTHON") or sys.executable
+    """The ARTEMiS venv's python (has pymysql/yaml): the environment, else
+    fgo.env, else linux/venv, else this interpreter."""
+    candidates = [os.environ.get("FGO_PYTHON"), get_env_value(read_env_file(), "FGO_PYTHON"),
+                  str(Path(__file__).resolve().parent.parent / "venv" / "bin" / "python")]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return sys.executable
 
 
 def load_launcher_json():
@@ -907,7 +914,8 @@ class SetupTab(ttk.Frame):
 
         venv_python = str(Path(__file__).resolve().parent.parent / "venv" / "bin" / "python")
         venv_status = "found" if Path(venv_python).is_file() else "not created yet"
-        ttk.Label(self, text=f"Python environment (linux/venv): {venv_status}").grid(row=row, column=0, columnspan=2, sticky="w")
+        self.venv_status_var = tk.StringVar(value=f"Python environment (linux/venv): {venv_status}")
+        ttk.Label(self, textvariable=self.venv_status_var).grid(row=row, column=0, columnspan=2, sticky="w")
         ttk.Button(self, text="Set up / update", command=self._run_setup).grid(row=row, column=2, sticky="w")
         row += 1
         self.setup_status_var = tk.StringVar(value="")
@@ -984,6 +992,14 @@ class SetupTab(ttk.Frame):
             self.setup_status_var.set(tail or "Done.")
         except Exception as exc:
             self.setup_status_var.set(f"Could not run setup.sh: {exc}")
+            return
+        # setup.sh wrote FGO_PYTHON into fgo.env; this process started before
+        # the venv existed, so pick it up here or the server tools run with
+        # the system python (no pymysql/yaml).
+        venv_python = get_env_value(read_env_file(), "FGO_PYTHON")
+        if venv_python and Path(venv_python).is_file():
+            os.environ["FGO_PYTHON"] = venv_python
+            self.venv_status_var.set("Python environment (linux/venv): found")
 
     def _save_clicked(self):
         try:
@@ -2605,13 +2621,22 @@ class ServerTab(ttk.Frame):
         self.update_idletasks()
         try:
             result = self._run_db_tool("status")
-            state = json.loads(result.stdout.strip().splitlines()[-1])
+            lines = result.stdout.strip().splitlines()
+            if not lines:
+                detail = (result.stderr.strip().splitlines() or ["no output"])[-1]
+                self.db_status_var.set(f"Could not run the check: {detail} (Setup tab -> Set up / update "
+                                       "creates the Python environment it needs)")
+                return
+            state = json.loads(lines[-1])
         except Exception as exc:
             self.db_status_var.set(f"Could not run the check: {exc}")
             return
         if not state["ok"]:
-            self.db_status_var.set(f"Connection failed: {state['error']} (a local database only runs "
-                                   "while the server is started)")
+            hint = "A local database only runs while the server is started."
+            if "refused" in state["error"].lower() and self.database_var.get().strip() != "3306":
+                hint = ("Check the Database port above: a fresh install uses 8888 for its bundled local "
+                        "MariaDB, a remote MariaDB usually listens on 3306.")
+            self.db_status_var.set(f"Connection failed: {state['error']}. {hint}")
         elif state["initialized"]:
             self.db_status_var.set(f"Connected - the game's tables are there ({state['tables']} tables). "
                                    "Nothing to initialise.")
