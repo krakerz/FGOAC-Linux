@@ -4,6 +4,7 @@ Connection settings come from Server/artemis/config/core.yaml's database:
 section; any --host/--user/--name/--port given (and FGO_DB_PASSWORD in the
 environment) override it, so unsaved GUI fields can be tested before Save.
 
+  show    -> one JSON line with the connection settings (no password).
   status  -> one JSON line: {"ok": bool, "error": str, "initialized": bool, "tables": int}
              "initialized" = the aime_user table exists (ARTEMiS's core user table).
   init    -> imports --sql (a mariadb-dump, e.g. linux/backups/*.sql) into the
@@ -11,7 +12,7 @@ environment) override it, so unsaved GUI fields can be tested before Save.
              Refuses when aime_user already exists, so it can't overwrite
              an existing account.
 
-usage: fgo_db.py status|init --core CORE_YAML [--sql FILE] [--host H] [--user U] [--name N] [--port P]
+usage: fgo_db.py show|status|init --core CORE_YAML [--sql FILE] [--host H] [--user U] [--name N] [--port P]
 """
 import argparse
 import json
@@ -93,13 +94,16 @@ def init(cfg, sql_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("status", "init"))
+    parser.add_argument("action", choices=("show", "status", "init"))
     parser.add_argument("--core", required=True)
     parser.add_argument("--sql")
     for option in ("host", "user", "name", "port"):
         parser.add_argument(f"--{option}")
     args = parser.parse_args()
     cfg = settings(args)
+    if args.action == "show":
+        print(json.dumps({key: value for key, value in cfg.items() if key != "password"}))
+        return 0
     if args.action == "status":
         print(json.dumps(status(cfg)))
         return 0

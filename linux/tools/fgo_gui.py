@@ -25,6 +25,7 @@ import mmap
 import re
 import shlex
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -851,6 +852,53 @@ class CardTranslations:
 
 TRANSLATIONS = CardTranslations()
 
+# Tabs showing card names (Deck, Draw Rates) - each has a Names: Raw/English
+# toggle; flipping one switches, redraws and syncs them all.
+CARD_NAME_VIEWS = []
+
+
+def add_card_names_toggle(tab, toolbar):
+    """Adds the shared Names toggle to `tab`'s toolbar. The tab must provide
+    _refresh_card_names() (redraw) and status_var (reported to Output)."""
+    ttk.Label(toolbar, text="Names").pack(side="left", padx=(16, 4))
+    english = TRANSLATIONS.english or get_env_value(read_env_file(), "FGO_GUI_CARD_NAMES") == "english"
+    tab.names_mode = tk.StringVar(value="English" if english else "Raw")
+    for label in ("Raw", "English"):
+        ttk.Radiobutton(toolbar, text=label, value=label, variable=tab.names_mode, style="Toolbutton",
+                         command=lambda: card_names_changed(tab)).pack(side="left")
+    CARD_NAME_VIEWS.append(tab)
+    if english and not TRANSLATIONS.english:
+        _apply_card_names(True)
+        tab.names_mode.set("English" if TRANSLATIONS.english else "Raw")
+
+
+def _apply_card_names(english):
+    """Loads the data on first use; returns an error text if English was
+    asked for but no name data exists."""
+    if english and not TRANSLATIONS.ensure_loaded():
+        TRANSLATIONS.english = False
+        return ("No English card names found - they come from \"FGOAC scooby.exe\" in the install root "
+                "or EN-patch folder, or a scooby checkout (FGO_SCOOBY_SRC).")
+    TRANSLATIONS.english = english
+    return None
+
+
+def card_names_changed(source):
+    english = source.names_mode.get() == "English"
+    if english and not TRANSLATIONS.loaded:
+        source.status_var.set("Loading English card names...")
+        source.update_idletasks()
+    error = _apply_card_names(english)
+    mode = "English" if TRANSLATIONS.english else "Raw"
+    # A GUI preference, saved immediately; never creates fgo.env on its own.
+    if env_file_path().exists():
+        set_env_values({"FGO_GUI_CARD_NAMES": mode.lower()})
+    CARD_NAME_VIEWS[:] = [tab for tab in CARD_NAME_VIEWS if tab.winfo_exists()]
+    for tab in CARD_NAME_VIEWS:
+        tab.names_mode.set(mode)
+        tab._refresh_card_names()
+    source.status_var.set(error or f"Card names: {mode}.")
+
 
 def _make_modal(dialog, parent):
     """transient() + grab_set(), safe against Tk's "grab failed: window not
@@ -919,6 +967,9 @@ class SetupTab(ttk.Frame):
     GUI front-end for what setup.sh already does via flags, plus the wine
     build picker and EN-patch payload location."""
 
+    # StringVars whose text goes to the window's shared Output box (App).
+    OUTPUT_VARS = ('patch_status_var', 'setup_status_var', 'status_var')
+
     def __init__(self, parent, on_saved=None):
         super().__init__(parent, padding=16)
         self.on_saved = on_saved
@@ -967,30 +1018,30 @@ class SetupTab(ttk.Frame):
         ttk.Button(patch_buttons, text="Revert EN Patch", command=self._revert_en_patch).pack(side="left", padx=(8, 0))
         row += 1
         self.patch_status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.patch_status_var, foreground="gray", wraplength=460).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
         row += 1
 
         ttk.Separator(self, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
         row += 1
-
-        venv_python = str(Path(__file__).resolve().parent.parent / "venv" / "bin" / "python")
-        venv_status = "found" if Path(venv_python).is_file() else "not created yet"
-        self.venv_status_var = tk.StringVar(value=f"Python environment (linux/venv): {venv_status}")
-        ttk.Label(self, textvariable=self.venv_status_var).grid(row=row, column=0, columnspan=2, sticky="w")
-        ttk.Button(self, text="Set up / update", command=self._run_setup).grid(row=row, column=2, sticky="w")
-        row += 1
-        self.setup_status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.setup_status_var, foreground="gray", wraplength=460).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        row += 1
-
-        ttk.Separator(self, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
-        row += 1
-        ttk.Button(self, text="Save environment settings", command=self._save_clicked).grid(row=row, column=0, sticky="w")
+        save_row = ttk.Frame(self)
+        save_row.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Button(save_row, text="Save environment settings", command=self._save_clicked).pack(side="left")
         self.status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=460).grid(
-            row=row, column=1, columnspan=2, sticky="w")
+
+        # Right-hand column: setup.sh's output is long and would push the
+        # left column past the window's bottom edge.
+        side = ttk.Frame(self)
+        side.grid(row=0, column=3, rowspan=row + 1, sticky="nw", padx=(24, 0))
+        ttk.Label(side, text="Python environment", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+        venv_python = str(Path(__file__).resolve().parent.parent / "venv" / "bin" / "python")
+        configured = get_env_value(env_text, "FGO_PYTHON")
+        venv_status = "found" if Path(venv_python).is_file() or (configured and Path(configured).is_file()) \
+            else "not created yet"
+        self.venv_status_var = tk.StringVar(value=f"linux/venv: {venv_status}")
+        ttk.Label(side, textvariable=self.venv_status_var).pack(anchor="w", pady=(4, 0))
+        ttk.Label(side, text="The local server's Python packages. Run once on a new setup, and again after "
+                             "updating this project.", foreground="gray", wraplength=280).pack(anchor="w")
+        ttk.Button(side, text="Set up / update", command=self._run_setup).pack(anchor="w", pady=(6, 0))
+        self.setup_status_var = tk.StringVar(value="")
 
     def _browse_dir(self, var):
         chosen = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
@@ -1061,7 +1112,7 @@ class SetupTab(ttk.Frame):
         venv_python = get_env_value(read_env_file(), "FGO_PYTHON")
         if venv_python and Path(venv_python).is_file():
             os.environ["FGO_PYTHON"] = venv_python
-            self.venv_status_var.set("Python environment (linux/venv): found")
+            self.venv_status_var.set("linux/venv: found")
 
     def _save_clicked(self):
         try:
@@ -1417,7 +1468,7 @@ class DisplayTab(ttk.Frame):
             ttk.Entry(frame, textvariable=var, width=10).grid(row=11 + i, column=1, sticky="w")
             self.photo_setting_vars[key] = var
         ttk.Button(frame, text="Open live photo panel...", command=self._open_photo_panel).grid(
-            row=16, column=0, columnspan=2, sticky="w", pady=(12, 0))
+            row=8, column=1, columnspan=2, sticky="w", pady=(6, 12))
 
     def _photo_values(self):
         name_to_value = {n: v for n, v in KEY_CHOICES}
@@ -2342,6 +2393,9 @@ class PhotoPanel(tk.Toplevel):
 
 
 class ControlsTab(ttk.Frame):
+    # StringVars whose text goes to the window's shared Output box (App).
+    OUTPUT_VARS = ('identify_status_var',)
+
     def __init__(self, parent):
         super().__init__(parent, padding=16)
         self.ini_text = segatools_ini_path().read_text(encoding="utf-8")
@@ -2395,8 +2449,6 @@ class ControlsTab(ttk.Frame):
         row += 1
         if HAVE_EVDEV:
             self.identify_status_var = tk.StringVar(value="")
-            ttk.Label(xi_frame, textvariable=self.identify_status_var, foreground="gray", wraplength=440).grid(
-                row=row, column=0, columnspan=3, sticky="w")
             row += 1
         ttk.Label(xi_frame, text="Movement:", width=20).grid(row=row, column=0, sticky="w", pady=3)
         movement_current = int(get_ini_value(self.ini_text, "xinput", "movement", "0") or 0)
@@ -2543,6 +2595,9 @@ class ControlsTab(ttk.Frame):
 
 
 class ServerTab(ttk.Frame):
+    # StringVars whose text goes to the window's shared Output box (App).
+    OUTPUT_VARS = ('db_status_var', 'status_var', 'server_status_var')
+
     def __init__(self, parent):
         super().__init__(parent, padding=16)
         self.status_var = tk.StringVar(value="")
@@ -2567,6 +2622,9 @@ class ServerTab(ttk.Frame):
             ttk.Label(self, text=label, width=26).grid(row=row, column=0, sticky="w", pady=4)
             ttk.Entry(self, textvariable=var, width=22).grid(row=row, column=1, sticky="w")
             row += 1
+        ttk.Button(self, text="Check current configuration", command=self._check_configuration).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        row += 1
 
         ttk.Separator(self, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
         row += 1
@@ -2590,12 +2648,8 @@ class ServerTab(ttk.Frame):
         row += 1
         self.db_status_var = tk.StringVar(value="Check the connection first; Init DB unlocks only for a "
                                                 "database without the game's tables.")
-        ttk.Label(self, textvariable=self.db_status_var, foreground="gray", wraplength=420).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
         row += 1
 
-        ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=420).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         # Right-hand column: the left one already fills the window's height.
         side = ttk.Frame(self)
@@ -2649,8 +2703,6 @@ class ServerTab(ttk.Frame):
         ttk.Button(server_buttons, text="Restart Server", command=self._restart_server).pack(side="left", padx=(6, 0))
         side_row += 1
         self.server_status_var = tk.StringVar(value="")
-        ttk.Label(side, textvariable=self.server_status_var, foreground="gray", wraplength=320).grid(
-            row=side_row, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     def _run_server_script(self, script_name, busy_text, timeout=60):
         script = Path(__file__).resolve().parent.parent / script_name
@@ -2662,6 +2714,44 @@ class ServerTab(ttk.Frame):
             self.server_status_var.set(tail or ("Done." if result.returncode == 0 else f"Failed (exit {result.returncode})."))
         except Exception as exc:
             self.server_status_var.set(f"Could not run {script_name}: {exc}")
+
+    def _check_configuration(self):
+        """What the install is actually configured with (saved values, not
+        the unsaved fields above) and which of its ports answer right now."""
+        try:
+            current = run_server_tool("show")
+        except Exception as exc:
+            self.status_var.set(f"Could not read the server configuration: {exc}")
+            return
+        try:
+            result = subprocess.run(
+                [fgo_python(), str(Path(__file__).resolve().parent / "fgo_db.py"), "show",
+                 "--core", str(install_root() / "Server" / "artemis" / "config" / "core.yaml")],
+                capture_output=True, text=True, timeout=15)
+            database = json.loads(result.stdout.strip().splitlines()[-1])
+        except Exception:  # noqa: BLE001 - shown as unknown
+            database = {}
+
+        def state(port, host="127.0.0.1"):
+            try:
+                with socket.create_connection((host, int(port)), timeout=0.5):
+                    return "listening"
+            except (OSError, ValueError):
+                return "not listening"
+
+        db_host = str(database.get("host", "?"))
+        db_port = database.get("port", current.get("database", "?"))
+        env_text = read_env_file()
+        report = get_env_value(env_text, "FGO_ACCOUNTING_REPORT_TIME")
+        self.status_var.set(
+            f"Host: {current.get('host', '?')} (server address {current.get('address', '?')})   "
+            f"Game/ALL.Net {current.get('http', '?')}: {state(current.get('http', 0))}   "
+            f"Billing {current.get('billing', '?')}: {state(current.get('billing', 0))}   "
+            f"Aime {current.get('aime', '?')}: {state(current.get('aime', 0))}\n"
+            f"Database: {database.get('user', '?')}@{db_host}:{db_port}/{database.get('name', '?')} "
+            f"- {state(db_port, '127.0.0.1' if db_host in ('localhost', '') else db_host)}\n"
+            f"Daily report time: {report[:2] + ':' + report[2:] if len(report) == 4 else 'game default (07:00)'}   "
+            f"Billing TLS 1.0: {'on' if get_env_value(env_text, 'FGO_BILLING_TLS10') == '1' else 'off'}")
 
     def _run_db_tool(self, action, *extra, timeout=30):
         """Runs fgo_db.py with the fields as typed (blank = core.yaml's value),
@@ -2927,6 +3017,9 @@ class PrintHistoryDialog(tk.Toplevel):
 
 
 class AccountTab(ttk.Frame):
+    # StringVars whose text goes to the window's shared Output box (App).
+    OUTPUT_VARS = ('status_var',)
+
     def __init__(self, parent):
         super().__init__(parent, padding=16)
         columns = ("aime_id", "master_name", "mode", "servants", "cards", "current")
@@ -2964,7 +3057,6 @@ class AccountTab(ttk.Frame):
                        command=lambda t=tag, l=label: self._upgrade(t, l)).grid(row=r, column=c, padx=4, pady=4)
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=700).pack(anchor="w", pady=(10, 0))
 
         self._accounts_by_iid = {}
         self.refresh()
@@ -3237,6 +3329,9 @@ class DeckTab(ttk.Frame):
     own CardStack.BuildEntities - nothing about specific cards/IDs is
     hardcoded here."""
 
+    # StringVars whose text goes to the window's shared Output box (App).
+    OUTPUT_VARS = ('status_var',)
+
     PAGE_SIZE = 48
     THUMB_SIZE = (72, 111)
     LIST_THUMB_SIZE = (56, 86)
@@ -3298,13 +3393,7 @@ class DeckTab(ttk.Frame):
                          command=self._on_view_mode_changed).pack(side="left")
         ttk.Radiobutton(toolbar, text="Icons", value="Icons", variable=self.view_mode, style="Toolbutton",
                          command=self._on_view_mode_changed).pack(side="left")
-        ttk.Label(toolbar, text="Names").pack(side="left", padx=(16, 4))
-        saved_names = get_env_value(read_env_file(), "FGO_GUI_CARD_NAMES")
-        self.names_mode = tk.StringVar(value="English" if saved_names == "english" else "Raw")
-        for label in ("Raw", "English"):
-            ttk.Radiobutton(toolbar, text=label, value=label, variable=self.names_mode, style="Toolbutton",
-                             command=self._on_names_mode_changed).pack(side="left")
-        self._apply_names_mode()
+        add_card_names_toggle(self, toolbar)
 
         self.summary_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.summary_var, foreground="gray", wraplength=780).pack(anchor="w", pady=(6, 4))
@@ -3380,7 +3469,6 @@ class DeckTab(ttk.Frame):
         open_folder_link.bind("<Button-1>", lambda e: self._loadout_open_folder())
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=780).pack(anchor="w", pady=(6, 0))
 
         self.reload()
 
@@ -3523,32 +3611,9 @@ class DeckTab(ttk.Frame):
         self.page = 0
         self._render_current_page()
 
-    def _apply_names_mode(self):
-        """Switches TRANSLATIONS to the toggle's mode; returns an error text
-        when English was asked for but no name data could be found."""
-        english = self.names_mode.get() == "English"
-        if english and not TRANSLATIONS.ensure_loaded():
-            self.names_mode.set("Raw")
-            english = False
-            error = ("No English card names found - they come from \"FGOAC scooby.exe\" in the install "
-                     "root or EN-patch folder, or a scooby checkout (FGO_SCOOBY_SRC).")
-        else:
-            error = None
-        TRANSLATIONS.english = english
-        return error
-
-    def _on_names_mode_changed(self):
-        if self.names_mode.get() == "English" and not TRANSLATIONS.loaded:
-            self.summary_var.set("Loading English card names...")
-            self.update_idletasks()
-        error = self._apply_names_mode()
-        # A GUI preference, saved immediately; never creates fgo.env on its own.
-        if env_file_path().exists():
-            set_env_values({"FGO_GUI_CARD_NAMES": self.names_mode.get().lower()})
+    def _refresh_card_names(self):
         self._apply_filter()
         self._refresh_selected_list()
-        if error:
-            self.summary_var.set(error)
 
     def _on_grid_canvas_resize(self, event):
         # The icon grid previously hardcoded 6 columns regardless of the
@@ -3977,6 +4042,9 @@ class DrawRatesTab(ttk.Frame):
     reads/writes the same server config file directly. Requires restarting
     the local server (Server tab's Restart Server button) to take effect."""
 
+    # StringVars whose text goes to the window's shared Output box (App).
+    OUTPUT_VARS = ('status_var',)
+
     PAGE_SIZE = 40
     THUMB_SIZE = (56, 86)
 
@@ -4017,6 +4085,7 @@ class DrawRatesTab(ttk.Frame):
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._apply_filter())
         ttk.Entry(toolbar, textvariable=self.search_var, width=24).pack(side="left", padx=(4, 0))
+        add_card_names_toggle(self, toolbar)
 
         bulk = ttk.Frame(self)
         bulk.pack(fill="x", pady=(6, 0))
@@ -4052,7 +4121,6 @@ class DrawRatesTab(ttk.Frame):
         bottom.pack(fill="x", pady=(8, 0))
         ttk.Button(bottom, text="Save Weights", command=self.save).pack(side="left")
         self.status_var = tk.StringVar(value="")
-        ttk.Label(bottom, textvariable=self.status_var, foreground="gray").pack(side="left", padx=(12, 0))
 
         # Presets - a named rate table you can switch between, share, or keep
         # as a starting point (e.g. "everyone equal" vs "only my favorites")
@@ -4082,6 +4150,9 @@ class DrawRatesTab(ttk.Frame):
         eligible_ids = {c["tc_id"] for c in self.cards}
         self.weights = load_summon_weights(eligible_ids)
         self._refresh_presets()
+        self._apply_filter()
+
+    def _refresh_card_names(self):
         self._apply_filter()
 
     def _apply_filter(self):
@@ -4358,6 +4429,9 @@ class BannersTab(ttk.Frame):
     plus a py_compile check that auto-restores on failure) - deliberately
     left as an explicit button rather than applied automatically."""
 
+    # StringVars whose text goes to the window's shared Output box (App).
+    OUTPUT_VARS = ('status_var',)
+
     def __init__(self, parent):
         super().__init__(parent, padding=16)
         self.vars = {}
@@ -4378,7 +4452,6 @@ class BannersTab(ttk.Frame):
         ttk.Button(actions, text="Save", command=self.save).pack(side="left")
         ttk.Button(actions, text="Clear All (show everything)", command=self._clear_all).pack(side="left", padx=(8, 0))
         self.status_var = tk.StringVar(value="")
-        ttk.Label(actions, textvariable=self.status_var, foreground="gray").pack(side="left", padx=(12, 0))
 
         list_container = ttk.Frame(self)
         list_container.pack(fill="both", expand=True)
@@ -4445,10 +4518,29 @@ class App(tk.Tk):
             for sequence in ("<Control-a>", "<Control-A>"):
                 self.bind_class(widget_class, sequence, self._select_all)
 
+        # One Output box at a fixed spot for every tab: each tab's buttons
+        # report here instead of in labels scattered through its form. It
+        # appears on a new message from the open tab and hides again after
+        # OUTPUT_HIDE_MS (paused while the mouse is over it).
+        self._outputs = {}
+        self._output_hide_job = None
+        self.output_frame = ttk.LabelFrame(self, text="Output", padding=(8, 2, 4, 4))
+        self.output_text = tk.Text(self.output_frame, height=4, wrap="word", relief="flat", borderwidth=0,
+                                   highlightthickness=0, font="TkDefaultFont", foreground="gray30",
+                                   background=ttk.Style().lookup("TFrame", "background") or "#d9d9d9")
+        output_scroll = ttk.Scrollbar(self.output_frame, orient="vertical", command=self.output_text.yview)
+        self.output_text.configure(yscrollcommand=output_scroll.set, state="disabled")
+        output_scroll.pack(side="right", fill="y")
+        self.output_text.pack(side="left", fill="both", expand=True)
+        self.output_frame.bind("<Enter>", lambda _event: self._cancel_output_hide())
+        self.output_frame.bind("<Leave>", lambda _event: self._schedule_output_hide())
+
         self.notebook = ttk.Notebook(self)
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self._hide_output())
 
         self.setup_tab = SetupTab(self.notebook, on_saved=self._on_setup_saved)
         self.notebook.add(self.setup_tab, text="Setup")
+        self._register_outputs(self.setup_tab)
 
         self.display_tab = self.controls_tab = self.server_tab = None
         self.account_tab = self.deck_tab = self.draw_rates_tab = self.banners_tab = None
@@ -4481,6 +4573,49 @@ class App(tk.Tk):
 
         self.notebook.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
+    def _register_outputs(self, tab):
+        for name in getattr(tab, "OUTPUT_VARS", ()):
+            var = getattr(tab, name, None)
+            if var is None:
+                continue
+            var.trace_add("write", lambda *_args, tab=tab, var=var: self._on_output(tab, var.get()))
+            if var.get():
+                self._outputs[str(tab)] = var.get()
+
+    def _on_output(self, tab, text):
+        if not text:
+            return  # a cleared label keeps the last message rather than blanking the box
+        self._outputs[str(tab)] = text
+        if self.notebook.select() == str(tab):
+            self._show_output()
+
+    OUTPUT_HIDE_MS = 5000
+
+    def _show_output(self):
+        text = self._outputs.get(self.notebook.select(), "")
+        if not text:
+            return
+        self.output_text.configure(state="normal")
+        self.output_text.delete("1.0", "end")
+        self.output_text.insert("1.0", text)
+        self.output_text.configure(state="disabled")
+        if not self.output_frame.winfo_ismapped():
+            self.output_frame.pack(side="bottom", fill="x", padx=8, pady=(6, 0), before=self.notebook)
+        self._schedule_output_hide()
+
+    def _schedule_output_hide(self):
+        self._cancel_output_hide()
+        self._output_hide_job = self.after(self.OUTPUT_HIDE_MS, self._hide_output)
+
+    def _cancel_output_hide(self):
+        if self._output_hide_job is not None:
+            self.after_cancel(self._output_hide_job)
+            self._output_hide_job = None
+
+    def _hide_output(self):
+        self._cancel_output_hide()
+        self.output_frame.pack_forget()
+
     @staticmethod
     def _select_all(event):
         event.widget.select_range(0, "end")
@@ -4502,6 +4637,9 @@ class App(tk.Tk):
         self.notebook.add(self.deck_tab, text="Deck")
         self.notebook.add(self.draw_rates_tab, text="Draw Rates")
         self.notebook.add(self.banners_tab, text="Banners")
+        for tab in (self.display_tab, self.controls_tab, self.server_tab, self.account_tab,
+                    self.deck_tab, self.draw_rates_tab, self.banners_tab):
+            self._register_outputs(tab)
 
     def _on_setup_saved(self):
         root = install_root_or_none()
