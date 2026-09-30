@@ -19,7 +19,8 @@
 # FGO_MONITOR_DEVICE, FGO_RESOLUTION_WIDTH, FGO_RESOLUTION_HEIGHT,
 # FGO_TARGET_FPS, FGO_RENDER_SCALE, FGO_GAMESCOPE, FGO_GAMESCOPE_FULLSCREEN,
 # FGO_GAMESCOPE_FSR, FGO_GAMESCOPE_SHARPNESS, FGO_GAMESCOPE_OUTPUT_WIDTH,
-# FGO_GAMESCOPE_OUTPUT_HEIGHT, FGO_GAMESCOPE_BACKEND, FGO_GAMESCOPE_EXTRA_ARGS.
+# FGO_GAMESCOPE_OUTPUT_HEIGHT, FGO_GAMESCOPE_BACKEND, FGO_GAMESCOPE_EXTRA_ARGS,
+# FGO_EXTRA_ENV, FGO_MANGOHUD.
 # Flags: --windowed --skip-server-check --chinese --experimental-audio --check-only
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -660,6 +661,17 @@ cd "$game_root" || fgo_die "Cannot enter $game_root" 1
 # -F fsr) then scales across, independent of GPU vendor since it's a
 # compositor-side shader, not a driver feature.
 launch_cmd=("${FGO_WINE:-wine}" "$inject_path" "${launch_arguments[@]}")
+# FGO_MANGOHUD=1: MangoHud overlay. The game draws with OpenGL, which MangoHud
+# only hooks through its wrapper's LD_PRELOAD shim - MANGOHUD=1 alone just
+# enables its Vulkan layer and shows nothing here. Wraps the game only, so
+# gamescope (below) isn't hooked too.
+if [ "${FGO_MANGOHUD:-0}" = "1" ]; then
+    if command -v mangohud >/dev/null 2>&1; then
+        launch_cmd=(mangohud "${launch_cmd[@]}")
+    else
+        fgo_warn "FGO_MANGOHUD=1 but mangohud is not installed - launching without the overlay."
+    fi
+fi
 if [ "${FGO_GAMESCOPE:-0}" = "1" ]; then
     fgo_require_cmd gamescope
     gamescope_output_width=${FGO_GAMESCOPE_OUTPUT_WIDTH:-$effective_resolution_width}
@@ -691,6 +703,32 @@ if [ "${FGO_GAMESCOPE:-0}" = "1" ]; then
     # with no window at all. SDL over X11 (XWayland) doesn't have that race.
     if [ "$gamescope_backend" = "sdl" ] && [ -n "${DISPLAY:-}" ]; then
         launch_cmd=(env SDL_VIDEODRIVER=x11 SDL_VIDEO_DRIVER=x11 "${launch_cmd[@]}")
+    fi
+fi
+
+# FGO_EXTRA_ENV: free-form extra environment for the game, e.g.
+# "MANGOHUD=1 DXVK_HUD=fps" (shell quoting honoured, so KEY="a b" works).
+# Only NAME=value tokens are applied; anything else is reported and skipped.
+if [ -n "${FGO_EXTRA_ENV:-}" ]; then
+    extra_env=()
+    while IFS= read -r -d '' assignment; do
+        extra_env+=("$assignment")
+    done < <("$FGO_PYTHON" -c '
+import re, shlex, sys
+try:
+    tokens = shlex.split(sys.argv[1])
+except ValueError as error:
+    print(f"WARNING: FGO_EXTRA_ENV: {error} - ignored.", file=sys.stderr)
+    tokens = []
+for token in tokens:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token, re.S):
+        sys.stdout.write(token + "\0")
+    else:
+        print(f"WARNING: FGO_EXTRA_ENV: skipping {token!r} (not NAME=value).", file=sys.stderr)
+' "$FGO_EXTRA_ENV")
+    if [ "${#extra_env[@]}" -gt 0 ]; then
+        fgo_log "Extra environment: ${extra_env[*]}"
+        launch_cmd=(env "${extra_env[@]}" "${launch_cmd[@]}")
     fi
 fi
 
