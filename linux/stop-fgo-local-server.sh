@@ -39,5 +39,32 @@ stop_pidfile() {
 
 stop_pidfile "ARTEMiS local server" "$state_dir/artemis.pid"
 stop_pidfile "local MariaDB" "$state_dir/mariadb.pid"
+
+# An ARTEMiS started from another install folder (e.g. an old copy kept next to
+# a fresh one) isn't in this install's pid file but still holds the same ports,
+# and fgo_server_config.py then refuses to save with "Stop the local server".
+# Stop it too - only when it really is ARTEMiS (index.py run from a
+# .../Server/artemis folder), never whatever else might own a port.
+config_tool="$FGO_INSTALL_ROOT/Server/tools/fgo_server_config.py"
+if ports=$("$FGO_PYTHON" -c '
+import json, subprocess, sys
+d = json.loads(subprocess.run([sys.executable, sys.argv[1], "show"], capture_output=True, text=True, check=True).stdout)
+print(d["http"], d["billing"], d["aime"])
+' "$config_tool" 2>/dev/null); then
+    for port in $ports; do
+        for pid in $(ss -ltnpH "sport = :$port" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+            cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+            case "$cwd" in */Server/artemis) ;; *) continue ;; esac
+            tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'index\.py' || continue
+            fgo_log "Stopping ARTEMiS from another install on port $port (pid $pid, $cwd)..."
+            kill -TERM "$pid" 2>/dev/null
+            for _ in $(seq 1 20); do
+                fgo_pid_alive "$pid" || break
+                sleep 0.5
+            done
+            fgo_pid_alive "$pid" && kill -9 "$pid" 2>/dev/null
+        done
+    done
+fi
 rm -f "$state_dir/server-start.lock"
 fgo_log "Local server stopped."

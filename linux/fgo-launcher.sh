@@ -168,6 +168,12 @@ elif command -v aplay >/dev/null 2>&1; then
     fi
 fi
 
+# core.yaml is what the server listens on; an older copy of fgo-launcher.json
+# or segatools.ini written back over the ports would otherwise make this wait
+# on a port nothing opens ("not reachable on required port(s)").
+"$FGO_PYTHON" "$SCRIPT_DIR/tools/sync_server_ports.py" "$install_root" \
+    || fgo_warn "Could not check the server ports in fgo-launcher.json/segatools.ini against core.yaml."
+
 eval "$("$FGO_PYTHON" "$SCRIPT_DIR/tools/read_launcher_config.py" "$launcher_config_path" "$main_config_path")"
 
 fgo_writable_layout "$install_root"

@@ -7,7 +7,9 @@ linux/fgo.env
 
 # Generated/local - safe to delete and regenerate (setup.sh recreates it).
 linux/venv/
-linux/backups/
+# Personal DB dumps stay local; artemis-init.sql (schema + default user, no logs) is what Init DB imports.
+linux/backups/*
+!linux/backups/artemis-init.sql
 linux/logs/
 **/__pycache__/
 *.pyc

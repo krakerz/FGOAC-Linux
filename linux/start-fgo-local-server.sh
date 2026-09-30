@@ -126,7 +126,12 @@ if [ "$service_ok" -ne 1 ]; then
 fi
 
 for port in "$SRV_HTTP" "$SRV_BILLING" "$SRV_AIME"; do
-    fgo_wait_tcp 127.0.0.1 "$port" 30 || fgo_die "ARTEMiS did not open required port $port. See $log_dir/artemis-stderr.log" 1
+    if ! fgo_wait_tcp 127.0.0.1 "$port" 30; then
+        # The last stderr line is usually the actual cause (e.g. an ImportError
+        # from an incompletely copied install).
+        last_error=$(grep -v '^[[:space:]]*$' "$log_dir/artemis-stderr.log" 2>/dev/null | tail -n 1)
+        fgo_die "ARTEMiS did not open required port $port${last_error:+: $last_error}. See $log_dir/artemis-stderr.log" 1
+    fi
 done
 
 if ! get_health | grep -q 'Service OK'; then
