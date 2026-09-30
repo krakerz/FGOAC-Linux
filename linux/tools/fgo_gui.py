@@ -1602,7 +1602,14 @@ class DisplayTab(ttk.Frame):
         photo.update(photo_values)  # keeps scooby-only fields such as panelKey
         self.graphics_data["photo"] = photo
         self.config_data["graphics"] = self.graphics_data
-        save_launcher_json(self.config_data)
+        # Merge into a fresh read: self.config_data is from when this tab was
+        # built, and writing it back whole would undo anything saved since
+        # (e.g. the server ports that Set up / update or the Server tab wrote).
+        fresh = load_launcher_json()
+        for key in ("resolutionWidth", "resolutionHeight", "targetFps", "displayMode", "windowed"):
+            fresh[key] = self.config_data[key]
+        fresh["graphics"] = {**(fresh.get("graphics") or {}), **self.graphics_data}
+        save_launcher_json(fresh)
         save_audio_volume({key: int(round(var.get())) for key, var in self.volume_vars.items()})
         set_env_values(gamescope_env)
 
@@ -2556,7 +2563,9 @@ class ControlsTab(ttk.Frame):
                 return mapping[name]
             return int(name, 16)  # a "0x..." fallback label from an unrecognized existing value
 
-        text = self.ini_text
+        # A fresh read, not self.ini_text: only this tab's sections change, and
+        # an older copy would put back e.g. [dns] ports changed since.
+        text = segatools_ini_path().read_text(encoding="utf-8")
         for _, key, _ in KEYBOARD_ACTIONS:
             value = resolve(key_name_to_value, self.keyboard_vars[key].get())
             text = set_ini_value(text, "keyboard", key, f"0x{value:X}")
@@ -4661,6 +4670,11 @@ class App(tk.Tk):
         self.display_tab.save()
         self.controls_tab.save()
         self.server_tab.save()
+        # Game-side port settings must match core.yaml whatever wrote them last.
+        result = subprocess.run([fgo_python(), str(Path(__file__).resolve().parent / "sync_server_ports.py"),
+                                 str(install_root())], capture_output=True, text=True, timeout=15)
+        if result.stdout.strip() or result.returncode:
+            self.server_tab.status_var.set((result.stdout or result.stderr).strip())
 
     def on_save(self):
         first_setup = self.display_tab is None
