@@ -56,3 +56,19 @@ x86_64-w64-mingw32-gcc -shared -O2 -Wall -o feedback_shim.dll feedback_shim.c -l
 
 Add `-DFEEDBACK_SHIM_DEBUG` to log every step to `Z:\tmp\feedback-shim-debug.log`,
 same pattern as `ntquery_shim.dll`'s debug flag.
+
+## photo_bridge.exe
+
+Not injected into the game. fgohook's photo mode exposes its camera settings
+through a Windows named file mapping (`Local\FGOLocalPhoto_<pid>`), which a
+native Linux process can't open. The GUI's live Photo panel runs this small
+console program under the game's own wine/prefix instead and talks to it over
+stdin/stdout, one command per line (`status`, `cmd 1|2|4`, `speed`, `fov`,
+`dof`), one JSON reply per line. It only ever writes the known camera fields
+(speed, FOV, depth of field, commands).
+
+### Rebuilding
+
+```sh
+x86_64-w64-mingw32-gcc -O2 -Wall -o photo_bridge.exe photo_bridge.c
+```

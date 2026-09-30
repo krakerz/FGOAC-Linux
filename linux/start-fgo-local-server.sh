@@ -115,6 +115,11 @@ if [ "$service_ok" -ne 1 ]; then
     if ! py_check=$("$FGO_PYTHON" -I -c "import yaml,sqlalchemy,aiomysql,uvicorn,starlette,Crypto" 2>&1); then
         fgo_die "$FGO_PYTHON is missing required packages: $py_check. Install them with: $FGO_PYTHON -m pip install pyyaml sqlalchemy aiomysql uvicorn starlette pycryptodome (or set FGO_PYTHON to a venv that already has them)" 1
     fi
+    # FGO_BILLING_TLS10=1 lets amdaemon's accounting report through the billing
+    # port (TLS 1.0, refused by OpenSSL 3 at Python's default security level).
+    tls_mode=revert; [ "${FGO_BILLING_TLS10:-0}" = "1" ] && tls_mode=apply
+    "$FGO_PYTHON" "$SCRIPT_DIR/tools/patch_billing_tls.py" "$tls_mode" "$artemis_root/index.py" \
+        || fgo_warn "Could not $tls_mode the billing TLS 1.0 patch (see above)."
     server_out="$log_dir/artemis-stdout.log"; server_err="$log_dir/artemis-stderr.log"
     ( cd "$artemis_root" && fgo_spawn_detached "$state_dir/artemis.pid" "$FGO_PYTHON" index.py --config config \
         >"$server_out" 2>"$server_err" </dev/null )
