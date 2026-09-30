@@ -608,6 +608,13 @@ if [ "${FGO_UNLOCK_HIGH_FPS:-0}" = "1" ]; then
         || fgo_die "FGO_UNLOCK_HIGH_FPS=1 but $hook_path could not be patched (see above). Unset it to launch normally." 1
 fi
 
+# Booting shortly before amdaemon's daily ALL.Net accounting report can hang at
+# "ALL.Net : WAIT (A, BUSY)"; FGO_ACCOUNTING_REPORT_TIME (HHMM) moves it.
+if [ -n "${FGO_ACCOUNTING_REPORT_TIME:-}" ] && [ -n "${WINEPREFIX:-}" ]; then
+    "$FGO_PYTHON" "$SCRIPT_DIR/tools/set_accounting_report_time.py" "$WINEPREFIX" "$FGO_ACCOUNTING_REPORT_TIME" \
+        || fgo_warn "Could not set the ALL.Net accounting report time (see above)."
+fi
+
 pending_bgm_directory="$game_root/BGM/pending"
 if [ -d "$pending_bgm_directory" ]; then
     bgm_backup_directory="$game_root/backup/bgm-$(date +%Y%m%d_%H%M%S)"

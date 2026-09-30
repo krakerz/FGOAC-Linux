@@ -24,9 +24,11 @@ import queue
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -34,6 +36,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from segatools_ini import get_ini_value, set_ini_value  # noqa: E402
 from fgo_env import env_file_path, get_env_value, read_env_file, set_env_values  # noqa: E402
+import photo_assets  # noqa: E402
 
 try:
     from PIL import Image, ImageTk
@@ -1413,8 +1416,8 @@ class DisplayTab(ttk.Frame):
 
 class PhotoBridge:
     """linux/shims/photo_bridge.exe run under the game's own wine/prefix (a native
-    process can't open the hook's Wine named mapping). One worker thread does all
-    pipe I/O so a slow wine start never blocks the Tk loop."""
+    process can't open the hook's Wine named mappings). Synchronous request/reply;
+    PhotoPanel calls it only from its worker thread."""
 
     def __init__(self):
         env_text = read_env_file()
@@ -1433,9 +1436,7 @@ class PhotoBridge:
         exe = Path(__file__).resolve().parent.parent / "shims" / "photo_bridge.exe"
         self.process = subprocess.Popen([wine, str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
-        self.requests = queue.Queue()
-        self.replies = queue.Queue()
-        threading.Thread(target=self._run, daemon=True).start()
+        self.alive = True
 
     @staticmethod
     def _running_game_env():
@@ -1448,132 +1449,745 @@ class PhotoBridge:
             return dict(item.split("=", 1) for item in raw.decode(errors="replace").split("\0") if "=" in item)
         return None
 
-    def _run(self):
-        while True:
-            line = self.requests.get()
-            if line is None:
-                return
-            try:
-                self.process.stdin.write(line + "\n")
-                self.process.stdin.flush()
-                reply = self.process.stdout.readline()
-            except (OSError, ValueError):
-                reply = ""
-            if not reply:
-                self.replies.put((line, {"connected": False, "stopped": True}))
-                return
-            try:
-                self.replies.put((line, json.loads(reply)))
-            except ValueError:
-                pass
+    def request(self, line):
+        if not self.alive:
+            return {}
+        try:
+            self.process.stdin.write(line + "\n")
+            self.process.stdin.flush()
+            reply = self.process.stdout.readline()
+        except (OSError, ValueError):
+            reply = ""
+        if not reply:
+            self.alive = False
+            return {}
+        try:
+            return json.loads(reply)
+        except ValueError:
+            return {}
 
-    def send(self, line):
-        self.requests.put(line)
+    def read(self, block, offset, length):
+        reply = self.request(f"read {block} {offset} {length}")
+        return bytes.fromhex(reply["hex"]) if reply.get("ok") else None
+
+    def write(self, block, offset, data):
+        return bool(data) and self.request(f"write {block} {offset} {data.hex()}").get("ok", False)
 
     def close(self):
-        self.requests.put("quit")
-        self.requests.put(None)
         try:
-            self.process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
+            self.request("quit")
+        finally:
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
+# Photo block layouts (scooby PhotoFaceView / PhotoModelView / PhotoBodyView /
+# PhotoWeaponMotion). Each block has a request flag the game clears to 0 once
+# it has applied our write; face/body also carry a seqlock (odd = updating).
+FACE_ACTORS, FACE_ACTOR_STRIDE = 296, 80
+BODY_BONES, BODY_BONE_STRIDE, BODY_BASELINE, BODY_POSE = 64, 72, 36928, 57408
+WEAPON_COUNT, WEAPON_START, WEAPON_STRIDE = 77888, 77896, 19568
+WEAPON_ATTACH_POINTS = ["", "Right hand", "Left hand", "", "Upper body", "Chest", "Left thigh", "Lower body",
+                        "Head", "Waist", "Right forearm", "Left forearm", "Root", "Base"]
+
+
+def _cstr(raw):
+    return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+class PhotoWorker:
+    """Owns all bridge I/O on one thread: polls game state into `snapshot` and
+    runs queued actions (callables taking the bridge) in order."""
+
+    def __init__(self):
+        self.bridge = PhotoBridge()
+        self.actions = queue.Queue()
+        self.results = queue.Queue()
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def do(self, action):
+        self.actions.put(action)
+
+    def stop(self):
+        self.stopped.set()
+        self.thread.join(timeout=5)
+        self.bridge.close()
+
+    def _run(self):
+        while not self.stopped.is_set() and self.bridge.alive:
+            deadline = time.monotonic() + 0.1
+            while True:
+                try:
+                    action = self.actions.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    result = action(self.bridge)
+                    if result is not None:
+                        self.results.put(result)
+                except Exception as exc:  # a failed action must not kill the worker
+                    self.results.put(("error", str(exc)))
+            self.results.put(("snapshot", self._poll()))
+            self.stopped.wait(max(0.0, deadline - time.monotonic()))
+        if not self.bridge.alive:
+            self.results.put(("stopped", None))
+
+    def _poll(self):
+        b = self.bridge
+        status = b.request("status")
+        snap = {"connected": bool(status.get("connected")), "active": bool(status.get("active")),
+                "fov": status.get("fov", 0.0), "pos": status.get("pos", [0, 0, 0])}
+        if not (snap["connected"] and snap["active"]):
+            return snap
+        header = b.read("face", 8, 16)
+        if header:
+            seq, count, _request, face_status = struct.unpack("<4i", header)
+            if not seq & 1 and 0 <= count <= 64:
+                raw = b.read("face", FACE_ACTORS, count * FACE_ACTOR_STRIDE) if count else b""
+                again = b.read("face", 8, 4)
+                if raw is not None and again and struct.unpack("<i", again)[0] == seq:
+                    snap["actors"] = [
+                        (struct.unpack_from("<Q", raw, i * FACE_ACTOR_STRIDE)[0],
+                         _cstr(raw[i * FACE_ACTOR_STRIDE + 16:i * FACE_ACTOR_STRIDE + 80]),
+                         struct.unpack_from("<I", raw, i * FACE_ACTOR_STRIDE + 8)[0]) for i in range(count)]
+            snap["face_status"] = face_status
+        model = b.read("model", 8, 56)
+        if model:
+            flag, model_status = struct.unpack_from("<2i", model, 0)
+            snap["model_status"], snap["model_detail"] = model_status, struct.unpack_from("<i", model, 36)[0]
+            if flag == 0:
+                mask, count = struct.unpack_from("<2i", model, 48)
+                if 0 <= count <= 10:
+                    names = b.read("model", 64, count * 64) if count else b""
+                    if names is not None:
+                        snap["weapons"] = [_cstr(names[i * 64:(i + 1) * 64]) for i in range(count)]
+                        snap["weapon_mask"] = mask
+        body = b.read("body", 8, 48)
+        if body:
+            seq, count, actor, command, body_status, joint = struct.unpack_from("<iiQiii", body, 0)
+            echo, generation = struct.unpack_from("<QQ", body, 32)
+            snap["body"] = {"seq": seq, "count": count, "command": command, "status": body_status,
+                            "joint": joint, "actor": echo, "generation": generation}
+        return snap
+
+
+def read_body_rig(bridge, actor):
+    """Bone list + baseline for the rig the game loaded for `actor` (None if the
+    block is mid-update or belongs to another actor)."""
+    header = bridge.read("body", 8, 48)
+    if not header:
+        return None
+    seq, count, _a, _cmd, _status, joint = struct.unpack_from("<iiQiii", header, 0)
+    echo, generation = struct.unpack_from("<QQ", header, 32)
+    if seq & 1 or not 0 < count <= 512 or echo != actor:
+        return None
+    raw = bridge.read("body", BODY_BONES, count * BODY_BONE_STRIDE)
+    base = bridge.read("body", BODY_BASELINE, count * 40)
+    weapons_raw = bridge.read("body", WEAPON_COUNT, 4)
+    if raw is None or base is None or weapons_raw is None:
+        return None
+    bones = []
+    for i in range(count):
+        at = i * BODY_BONE_STRIDE
+        index, parent = struct.unpack_from("<2i", raw, at)
+        bones.append((index, parent, _cstr(raw[at + 8:at + 72])))
+    rigs = []
+    weapon_count = struct.unpack("<i", weapons_raw)[0]
+    for slot in range(weapon_count if 0 <= weapon_count <= 10 else 0):
+        start = WEAPON_START + slot * WEAPON_STRIDE
+        head = bridge.read("body", start, 96)
+        if not head:
+            continue
+        rig, mesh, pose, bone_count, weapon_joint = struct.unpack_from("<QQQii", head, 0)
+        if not 0 < bone_count <= 128:
+            continue
+        bone_raw = bridge.read("body", start + 96, bone_count * 72)
+        weapon_base = bridge.read("body", start + 9312, bone_count * 40)
+        if bone_raw is None or weapon_base is None:
+            continue
+        weapon_bones = [(*struct.unpack_from("<2i", bone_raw, j * 72), _cstr(bone_raw[j * 72 + 8:j * 72 + 72]))
+                        for j in range(bone_count)]
+        rigs.append({"slot": slot, "rig": rig, "mesh": mesh, "pose": pose, "name": _cstr(head[32:96]),
+                     "joint_type": weapon_joint, "bones": weapon_bones,
+                     "baseline": list(struct.unpack(f"<{bone_count * 10}f", weapon_base))})
+    again = bridge.read("body", 8, 4)
+    if not again or struct.unpack("<i", again)[0] != seq:
+        return None
+    return {"actor": actor, "generation": generation, "joint": joint, "bones": bones,
+            "baseline": list(struct.unpack(f"<{count * 10}f", base)), "weapons": rigs}
 
 
 class PhotoPanel(tk.Toplevel):
     """Live controls for fgohook's photo mode - the Linux counterpart of scooby's
-    Photo window's camera part (speed, FOV, depth of field, commands)."""
+    Photo window: camera, character position/weapons, expression and pose."""
 
     def __init__(self, parent, settings):
         super().__init__(parent)
         self.title("Photo mode")
         self.resizable(False, False)
+        self.app_root = install_root() / "App"
         self.settings = settings
-        self.bridge = PhotoBridge()
+        self.worker = PhotoWorker()
+        self.snapshot = {}
         self.connected = False
         self.active = False
-        self.status_pending = False
-        self.status_var = tk.StringVar(value="Starting the bridge (first start can take a few seconds)...")
-        ttk.Label(self, textvariable=self.status_var, wraplength=420).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 8))
-        buttons = ttk.Frame(self)
-        buttons.grid(row=1, column=0, columnspan=3, sticky="w", padx=12)
-        for text, command in (("Enter / Exit", 1), ("Reset camera", 2), ("Resume game", 4)):
-            ttk.Button(buttons, text=text, command=lambda c=command: self.bridge.send(f"cmd {c}")).pack(
-                side="left", padx=(0, 8))
+        self.actor_by_label = {}
 
+        self.status_var = tk.StringVar(value="Starting the bridge (first start can take a few seconds)...")
+        ttk.Label(self, textvariable=self.status_var, wraplength=460).pack(anchor="w", padx=12, pady=(12, 6))
+        buttons = ttk.Frame(self)
+        buttons.pack(anchor="w", padx=12)
+        for text, command in (("Enter / Exit", 1), ("Reset camera", 2), ("Resume game", 4)):
+            ttk.Button(buttons, text=text, command=lambda c=command: self.worker.do(
+                lambda b, c=c: (b.request(f"cmd {c}"), None)[1])).pack(side="left", padx=(0, 8))
+        actor_row = ttk.Frame(self)
+        actor_row.pack(anchor="w", padx=12, pady=(8, 4))
+        ttk.Label(actor_row, text="Character:").pack(side="left")
+        self.actor_var = tk.StringVar()
+        self.actor_box = ttk.Combobox(actor_row, textvariable=self.actor_var, state="readonly", width=34)
+        self.actor_box.pack(side="left", padx=(6, 0))
+        self.actor_box.bind("<<ComboboxSelected>>", lambda _e: self._on_actor_changed())
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        self._build_camera(ttk.Frame(notebook, padding=8), notebook)
+        self._build_character(ttk.Frame(notebook, padding=8), notebook)
+        self._build_expression(ttk.Frame(notebook, padding=8), notebook)
+        self._build_pose(ttk.Frame(notebook, padding=8), notebook)
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.poll_id = self.after(100, self._poll)
+
+    # --- widgets -------------------------------------------------------------
+    @staticmethod
+    def _slider(frame, row, label, var, lo, hi, resolution, on_change, length=300):
+        ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8))
+        tk.Scale(frame, variable=var, from_=lo, to=hi, resolution=resolution, orient="horizontal", length=length,
+                 command=lambda _v: on_change()).grid(row=row, column=1, sticky="w")
+        return row + 1
+
+    def _build_camera(self, frame, notebook):
+        notebook.add(frame, text="Camera")
         self.fov_var = tk.DoubleVar(value=32.0)
-        self.speed_var = tk.DoubleVar(value=settings["speed"])
-        self.dof_var = tk.BooleanVar(value=settings["dof"])
-        self.dof_vars = {key: tk.DoubleVar(value=settings[key]) for key in ("focus", "focusRange", "falloff", "blur")}
-        row = 2
-        row = self._slider(row, "FOV", self.fov_var, 5, 150, 0.5, lambda _v: self.bridge.send(f"fov {self.fov_var.get():.3f}"))
-        row = self._slider(row, "Move speed", self.speed_var, 0.05, 10, 0.05,
-                           lambda _v: self.bridge.send(f"speed {self.speed_var.get():.3f}"))
-        ttk.Checkbutton(self, text="Custom depth of field", variable=self.dof_var, command=self._send_dof).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 0))
+        self.speed_var = tk.DoubleVar(value=self.settings["speed"])
+        self.dof_var = tk.BooleanVar(value=self.settings["dof"])
+        self.dof_vars = {k: tk.DoubleVar(value=self.settings[k]) for k in ("focus", "focusRange", "falloff", "blur")}
+        row = self._slider(frame, 0, "FOV", self.fov_var, 5, 150, 0.5,
+                           lambda: self._camera(f"fov {self.fov_var.get():.3f}"))
+        row = self._slider(frame, row, "Move speed", self.speed_var, 0.05, 10, 0.05,
+                           lambda: self._camera(f"speed {self.speed_var.get():.3f}"))
+        ttk.Checkbutton(frame, text="Custom depth of field", variable=self.dof_var, command=self._send_dof).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
         row += 1
         for key, label, lo, hi, _default in PHOTO_SETTINGS[1:]:
-            row = self._slider(row, label, self.dof_vars[key], lo, hi, 0.01 if hi <= 20 else 0.1,
-                               lambda _v: self._send_dof())
-        ttk.Label(self, text="Save these as defaults in Game Settings > Photo Mode.", foreground="gray").grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 12))
-        self.protocol("WM_DELETE_WINDOW", self._close)
-        self.poll_id = self.after(200, self._poll)
+            row = self._slider(frame, row, label, self.dof_vars[key], lo, hi, 0.01 if hi <= 20 else 0.1,
+                               self._send_dof)
+        ttk.Label(frame, text="Save these as defaults in Game Settings > Photo Mode.", foreground="gray").grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-    def _slider(self, row, label, var, lo, hi, resolution, on_change):
-        ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", padx=(12, 8))
-        tk.Scale(self, variable=var, from_=lo, to=hi, resolution=resolution, orient="horizontal", length=300,
-                 command=on_change).grid(row=row, column=1, sticky="w")
-        return row + 1
+    def _build_character(self, frame, notebook):
+        notebook.add(frame, text="Character")
+        self.offset_vars = [tk.DoubleVar(value=0.0) for _ in range(3)]
+        self.rotation_vars = [tk.DoubleVar(value=0.0) for _ in range(3)]
+        self.head_angle_vars = [tk.DoubleVar(value=0.0) for _ in range(3)]
+        self.show_weapons_var = tk.BooleanVar(value=True)
+        self.head_follow_var = tk.BooleanVar(value=False)
+        self.manual_head_var = tk.BooleanVar(value=False)
+        row = 0
+        for axis, var in zip("XYZ", self.offset_vars):
+            row = self._slider(frame, row, f"Position {axis}", var, -20, 20, 0.01, self._publish_model)
+        for axis, var in zip("XYZ", self.rotation_vars):
+            row = self._slider(frame, row, f"Rotation {axis}", var, -180, 180, 1, self._publish_model)
+        for text, var in (("Show weapons", self.show_weapons_var), ("Head follows the camera", self.head_follow_var),
+                          ("Set head angle by hand", self.manual_head_var)):
+            ttk.Checkbutton(frame, text=text, variable=var, command=self._publish_model).grid(
+                row=row, column=0, columnspan=2, sticky="w")
+            row += 1
+        for axis, var in zip("XYZ", self.head_angle_vars):
+            row = self._slider(frame, row, f"Head {axis}", var, -180, 180, 1, self._publish_model)
+        weapon_row = ttk.Frame(frame)
+        weapon_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.weapon_choice_var = tk.StringVar(value="")
+        self.weapon_mode_var = tk.StringVar(value="Leave as is")
+        self.weapon_point_var = tk.StringVar(value="Original attach point")
+        self.weapon_box = ttk.Combobox(weapon_row, textvariable=self.weapon_choice_var, state="readonly", width=22)
+        self.weapon_box.pack(side="left")
+        self.weapon_box.bind("<<ComboboxSelected>>", lambda _e: self._load_weapon_editor())
+        mode_box = ttk.Combobox(weapon_row, textvariable=self.weapon_mode_var, state="readonly", width=11,
+                                values=["Leave as is", "Show", "Hide"])
+        mode_box.pack(side="left", padx=(6, 0))
+        mode_box.bind("<<ComboboxSelected>>", lambda _e: self._weapon_edited())
+        self.weapon_point_box = ttk.Combobox(weapon_row, textvariable=self.weapon_point_var, state="readonly", width=20)
+        self.weapon_point_box.pack(side="left", padx=(6, 0))
+        self.weapon_point_box.bind("<<ComboboxSelected>>", lambda _e: self._weapon_edited())
+        self.weapon_modes = [0] * 10
+        self.weapon_states = [0] * 10
+        self.weapon_names = []
+        self.weapon_mask = -1
+        row += 1
+        self.model_status_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.model_status_var, foreground="gray", wraplength=420).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+    def _build_expression(self, frame, notebook):
+        notebook.add(frame, text="Expression")
+        self.expression_var = tk.StringVar()
+        self.expression_box = ttk.Combobox(frame, textvariable=self.expression_var, state="readonly", width=44)
+        self.expression_box.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.expression_box.bind("<<ComboboxSelected>>", lambda _e: self._on_expression_changed())
+        self.expression_frame_var = tk.DoubleVar(value=0)
+        self.expression_scale = tk.Scale(frame, variable=self.expression_frame_var, from_=0, to=60, resolution=1,
+                                         orient="horizontal", length=380, label="Frame (60 per second)",
+                                         command=lambda _v: self._publish_face())
+        self.expression_scale.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        row = ttk.Frame(frame)
+        row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.expression_play = ttk.Button(row, text="Play", command=self._toggle_expression_play)
+        self.expression_play.pack(side="left")
+        ttk.Button(row, text="Restore original expression", command=self._restore_expression).pack(
+            side="left", padx=(8, 0))
+        self.face_status_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.face_status_var, foreground="gray").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.expressions = {}
+        self.expression_playing = False
+
+    def _build_pose(self, frame, notebook):
+        notebook.add(frame, text="Pose")
+        ttk.Label(frame, text="Only motions that fit the selected character's skeleton are listed.",
+                  foreground="gray").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.motion_var = tk.StringVar()
+        self.motion_box = ttk.Combobox(frame, textvariable=self.motion_var, state="readonly", width=44)
+        self.motion_box.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.motion_box.bind("<<ComboboxSelected>>", lambda _e: self._on_motion_changed())
+        self.motion_frame_var = tk.DoubleVar(value=0)
+        self.motion_scale = tk.Scale(frame, variable=self.motion_frame_var, from_=0, to=1, resolution=1,
+                                     orient="horizontal", length=380, label="Frame (60 per second)",
+                                     command=lambda _v: self._pose_dragged())
+        self.motion_scale.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        row = ttk.Frame(frame)
+        row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.motion_play = ttk.Button(row, text="Play", command=self._toggle_motion_play)
+        self.motion_play.pack(side="left")
+        ttk.Button(row, text="Restore original motion", command=self._restore_motion).pack(side="left", padx=(8, 0))
+        self.pose_status_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.pose_status_var, foreground="gray", wraplength=420).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.rig = None
+        self.rig_requested_for = 0
+        self.motions = {}
+        self.motion = None
+        self.weapon_clips = []
+        self.motion_playing = False
+        self.physics_reset = False
+        self.pose_pending = False
+        self.catalog_version = 0
+
+    # --- camera --------------------------------------------------------------
+    def _camera(self, line):
+        self.worker.do(lambda b, line=line: (b.request(line), None)[1])
 
     def _send_dof(self):
         values = " ".join(f"{self.dof_vars[k].get():.3f}" for k in ("focus", "focusRange", "falloff", "blur"))
-        self.bridge.send(f"dof {1 if self.dof_var.get() else 0} {values}")
+        self._camera(f"dof {1 if self.dof_var.get() else 0} {values}")
 
+    # --- polling -------------------------------------------------------------
     def _poll(self):
         try:
             while True:
-                line, reply = self.bridge.replies.get_nowait()
-                if line == "status":
-                    self.status_pending = False
-                    self._show_status(reply)
-                elif reply.get("stopped"):
-                    self._show_status(reply)
+                kind, value = self.worker.results.get_nowait()
+                if kind == "snapshot":
+                    self._show_snapshot(value)
+                elif kind == "rig":
+                    self._rig_loaded(value)
+                elif kind == "catalog":
+                    self._catalog_loaded(*value)
+                elif kind == "motion":
+                    self._motion_loaded(*value)
+                elif kind == "retry_model":
+                    self.after(120, self._publish_model)
+                elif kind == "error":
+                    self.pose_status_var.set(value)
+                elif kind == "stopped":
+                    self.status_var.set("The photo bridge stopped - close and reopen this window.")
         except queue.Empty:
             pass
-        if not self.status_pending:
-            self.status_pending = True
-            self.bridge.send("status")
-        self.poll_id = self.after(500, self._poll)
+        self.poll_id = self.after(50, self._poll)
 
-    def _show_status(self, status):
-        if status.get("stopped"):
-            self.status_var.set("The photo bridge stopped - close and reopen this window.")
-            return
-        connected = bool(status.get("connected"))
+    def _show_snapshot(self, snap):
+        self.snapshot = snap
+        connected, active = snap.get("connected", False), snap.get("active", False)
         if connected and not self.connected:
-            # Like scooby: push the configured speed and depth of field on connect.
-            self.bridge.send(f"speed {self.speed_var.get():.3f}")
+            self._camera(f"speed {self.speed_var.get():.3f}")  # like scooby: push defaults on connect
             self._send_dof()
-        self.connected = connected
-        active = bool(status.get("active"))
-        if active and not self.active and status.get("fov"):
-            self.fov_var.set(round(float(status["fov"]), 1))  # start the slider at the game's own FOV
-        self.active = active
+        if active and not self.active and snap.get("fov"):
+            self.fov_var.set(round(float(snap["fov"]), 1))
+        if self.active and not active:
+            self._stop_playback()
+            self.rig = None
+            self.rig_requested_for = 0
+        self.connected, self.active = connected, active
         if not connected:
-            self.status_var.set("Waiting for the game... (start it with Save & Play; photo mode needs a scene "
-                                "with a camera, e.g. the lobby)")
-        elif self.active:
-            x, y, z = status.get("pos", [0, 0, 0])
-            self.status_var.set(f"In photo mode - camera at {x:.2f}, {y:.2f}, {z:.2f}, FOV {status.get('fov', 0):.1f}")
-        else:
+            self.status_var.set("Waiting for the game... (photo mode needs a scene with a camera, e.g. the lobby)")
+        elif not active:
             self.status_var.set("Connected to the game - photo mode off (press the photo key or Enter / Exit)")
+        else:
+            x, y, z = snap.get("pos", [0, 0, 0])
+            self.status_var.set(f"In photo mode - camera at {x:.2f}, {y:.2f}, {z:.2f}, FOV {snap.get('fov', 0):.1f}")
+        if "actors" in snap:
+            self._update_actors(snap["actors"])
+        if active:
+            self.face_status_var.set({1: "Playing" if self.expression_playing else "Expression applied",
+                                      -1: "That character is no longer in the scene.",
+                                      -2: "The game has not loaded that expression.",
+                                      -3: "Character data is not available right now."}.get(
+                snap.get("face_status"), f"{len(snap.get('actors', []))} characters in the scene"))
+            self._update_model_status(snap)
+            self._update_weapons(snap)
+            self._check_rig(snap.get("body"))
+
+    def _update_actors(self, actors):
+        labels = [f"{token} - model {model}" for _id, token, model in actors]
+        self.actor_by_label = {label: (actor_id, token) for label, (actor_id, token, _m) in zip(labels, actors)}
+        if list(self.actor_box.cget("values")) != labels:
+            current = self.actor_var.get()
+            self.actor_box.configure(values=labels)
+            if current not in labels:
+                self.actor_var.set(labels[0] if len(labels) == 1 else "")
+                self._on_actor_changed()
+
+    def selected_actor(self):
+        return self.actor_by_label.get(self.actor_var.get(), (0, ""))
+
+    def _on_actor_changed(self):
+        self._stop_playback()
+        actor_id, token = self.selected_actor()
+        self.expressions = {}
+        self.expression_box.configure(values=[])
+        self.expression_var.set("")
+        if token:
+            motions = photo_assets.list_face_motions(self.app_root, token)
+            self.expressions = {name: duration for name, _source, duration in motions}
+            self.expression_box.configure(values=[name for name, _s, _d in motions])
+        for var in self.offset_vars + self.rotation_vars + self.head_angle_vars:
+            var.set(0.0)
+        self.show_weapons_var.set(True)
+        self.head_follow_var.set(False)
+        self.manual_head_var.set(False)
+        self.weapon_modes, self.weapon_states = [0] * 10, [0] * 10
+        self.weapon_mask = -1
+        self.rig = None
+        self.motion = None
+        self.motion_box.configure(values=[])
+        self.motion_var.set("")
+        self.rig_requested_for = 0
+        if actor_id:
+            self.pose_status_var.set("Loading the character's skeleton...")
+
+    # --- expression ----------------------------------------------------------
+    def _on_expression_changed(self):
+        self.expression_playing = False
+        self.expression_play.configure(text="Play")
+        duration = self.expressions.get(self.expression_var.get(), 1.0)
+        self.expression_scale.configure(to=max(1, min(36000, int(duration * 60 + 0.999))))
+        self.expression_frame_var.set(0)
+        self._publish_face()
+
+    def _publish_face(self, name=None):
+        actor_id, _token = self.selected_actor()
+        if not actor_id or not self.active:
+            return
+        name = self.expression_var.get() if name is None else name
+        frame = int(self.expression_frame_var.get())
+        payload = struct.pack("<Qq", actor_id, frame) + name.encode("ascii", "replace")[:255].ljust(256, b"\0")
+
+        def action(b, payload=payload):
+            flag = b.read("face", 16, 4)
+            if flag and struct.unpack("<i", flag)[0] == 0 and b.write("face", 24, payload):
+                b.write("face", 16, struct.pack("<i", 1))
+        self.worker.do(action)
+
+    def _restore_expression(self):
+        self._stop_playback()
+        self.expression_var.set("")
+        self._publish_face("")
+
+    def _toggle_expression_play(self):
+        if self.expression_playing:
+            self._stop_playback()
+            return
+        if not self.expression_var.get():
+            return
+        if self.expression_frame_var.get() >= float(self.expression_scale.cget("to")):
+            self.expression_frame_var.set(0)
+        self.expression_playing = True
+        self.expression_play.configure(text="Pause")
+        self.expression_clock = (time.monotonic(), self.expression_frame_var.get())
+        self._tick_expression()
+
+    def _tick_expression(self):
+        if not self.expression_playing:
+            return
+        start, first = self.expression_clock
+        frame = min(float(self.expression_scale.cget("to")), first + (time.monotonic() - start) * 60)
+        self.expression_frame_var.set(int(frame))
+        self._publish_face()
+        if frame >= float(self.expression_scale.cget("to")):
+            self._stop_playback()
+        else:
+            self.after(33, self._tick_expression)
+
+    # --- character position / weapons ------------------------------------------
+    def _publish_model(self):
+        actor_id, _token = self.selected_actor()
+        if not actor_id or not self.active:
+            return
+        head = struct.pack("<Q3fii", actor_id, *(v.get() for v in self.offset_vars),
+                           0 if self.show_weapons_var.get() else 1, 1 if self.head_follow_var.get() else 0)
+        choice = self._weapon_choice()
+        weapons = struct.pack("<ii", choice, 0)
+        modes = struct.pack("<10i", *self.weapon_modes) + struct.pack("<10i", *self.weapon_states)
+        tail = struct.pack("<3fi3f", *(v.get() for v in self.rotation_vars), 1 if self.manual_head_var.get() else 0,
+                           *(v.get() for v in self.head_angle_vars))
+
+        def action(b):
+            flag = b.read("model", 8, 4)
+            if not flag or struct.unpack("<i", flag)[0] != 0:
+                return ("retry_model", None)  # game still applying the last change
+            if b.write("model", 16, head[:8]) and b.write("model", 24, head[8:28]) and \
+                    b.write("model", 48, weapons) and b.write("model", 704, modes) and b.write("model", 824, tail):
+                b.write("model", 8, struct.pack("<i", 1))
+        self.worker.do(action)
+
+    def _update_model_status(self, snap):
+        text = {1: "Weapons are shown" if self.show_weapons_var.get() else "Weapons are hidden",
+                -1: "That character has left the scene.", -2: "Those values are not valid.",
+                -3: "This model cannot be edited right now.",
+                -5: "This weapon has no original attach point - pick one of the listed positions."}.get(
+            snap.get("model_status"), "Pick a character.")
+        if (self.head_follow_var.get() or self.manual_head_var.get()) and snap.get("model_detail") == -4:
+            text = "No usable head bone or follow limit was found on this character."
+        self.model_status_var.set(text)
+
+    def _weapon_choice(self):
+        label = self.weapon_choice_var.get()
+        return int(label.split(" - ", 1)[0]) if label and label[0].isdigit() else 0
+
+    def _update_weapons(self, snap):
+        if "weapons" not in snap:
+            return
+        names = snap["weapons"]
+        if names != self.weapon_names:
+            self.weapon_names = names
+            labels = ["Select a weapon to adjust"] + [f"{i + 1} - {n}" for i, n in enumerate(names)]
+            self.weapon_box.configure(values=labels)
+            if self.weapon_choice_var.get() not in labels:
+                self.weapon_choice_var.set(labels[0])
+            self.weapon_mask = -1
+        if snap.get("weapon_mask") != self.weapon_mask:
+            self.weapon_mask = snap.get("weapon_mask", 0)
+            self._load_weapon_editor()
+
+    def _load_weapon_editor(self):
+        choice = self._weapon_choice()
+        points = ["Original attach point"] + [name for bit, name in enumerate(WEAPON_ATTACH_POINTS)
+                                              if bit and name and self.weapon_mask > 0 and self.weapon_mask & (1 << bit)]
+        self.weapon_point_box.configure(values=points)
+        if choice:
+            self.weapon_mode_var.set(["Leave as is", "Show", "Hide"][self.weapon_modes[choice - 1]])
+            state = self.weapon_states[choice - 1]
+            name = WEAPON_ATTACH_POINTS[state] if 0 < state < len(WEAPON_ATTACH_POINTS) else ""
+            self.weapon_point_var.set(name if name in points else "Original attach point")
+        else:
+            self.weapon_mode_var.set("Leave as is")
+            self.weapon_point_var.set("Original attach point")
+
+    def _weapon_edited(self):
+        choice = self._weapon_choice()
+        if not choice:
+            return
+        self.weapon_modes[choice - 1] = ["Leave as is", "Show", "Hide"].index(self.weapon_mode_var.get())
+        point = self.weapon_point_var.get()
+        self.weapon_states[choice - 1] = WEAPON_ATTACH_POINTS.index(point) if point in WEAPON_ATTACH_POINTS else 0
+        self._publish_model()
+
+    # --- pose ------------------------------------------------------------------
+    def _check_rig(self, body):
+        actor_id, token = self.selected_actor()
+        if not actor_id or body is None:
+            return
+        if self.rig_requested_for != actor_id:
+            if body["command"] == 0:
+                self.rig_requested_for = actor_id
+                self.worker.do(lambda b, a=actor_id: (b.write("body", 16, struct.pack("<Q", a)) and
+                                                      b.write("body", 24, struct.pack("<i", 1)), None)[1])
+            return
+        if body["actor"] == actor_id and body["count"] > 0 and not body["seq"] & 1 and \
+                (self.rig is None or self.rig["generation"] != body["generation"]):
+            if getattr(self, "rig_loading", None) != (actor_id, body["generation"]):
+                self.rig_loading = (actor_id, body["generation"])
+                self.worker.do(lambda b, a=actor_id: ("rig", read_body_rig(b, a)))
+        status = body["status"]
+        if status < 0:
+            self.pose_status_var.set({-3: "The character's skeleton changed - pick the motion again.",
+                                      -4: "The motion pose failed its check."}.get(
+                status, "This character's pose cannot be edited."))
+        elif status == 2 and self.motion is not None:
+            self.pose_status_var.set("Playing" if self.motion_playing else "Motion applied")
+
+    def _rig_loaded(self, rig):
+        actor_id, token = self.selected_actor()
+        self.rig_loading = None
+        if rig is None or rig["actor"] != actor_id:
+            return
+        self.rig = rig
+        self.motion = None
+        self.catalog_version += 1
+        version = self.catalog_version
+        self.pose_status_var.set("Reading matching motions...")
+
+        def load(version=version, token=token, rig=rig):
+            try:
+                motions = photo_assets.list_body_motions(self.app_root, token, rig["joint"], rig["bones"])
+            except (OSError, photo_assets.FarcError) as exc:
+                self.worker.results.put(("error", f"Could not read the motions: {exc}"))
+                return
+            self.worker.results.put(("catalog", (version, motions)))
+        threading.Thread(target=load, daemon=True).start()
+
+    def _catalog_loaded(self, version, motions):
+        if version != self.catalog_version:
+            return
+        self.motions = {display: (entry, frames) for entry, display, frames in motions}
+        self.motion_box.configure(values=[display for _e, display, _f in motions])
+        self.pose_status_var.set(f"{len(motions)} motions fit this character.")
+
+    def _on_motion_changed(self):
+        self._stop_playback()
+        chosen = self.motions.get(self.motion_var.get())
+        actor_id, token = self.selected_actor()
+        if not chosen or self.rig is None:
+            return
+        entry, _frames = chosen
+        rig = self.rig
+        self.catalog_version += 1
+        version = self.catalog_version
+
+        def load(version=version):
+            try:
+                motion = photo_assets.load_body_motion(self.app_root, token, entry, rig["joint"], rig["bones"])
+                clips = photo_assets.load_weapon_clips(self.app_root, token, entry, rig["weapons"])
+            except (OSError, photo_assets.FarcError) as exc:
+                self.worker.results.put(("error", str(exc)))
+                return
+            self.worker.results.put(("motion", (version, motion, clips)))
+        threading.Thread(target=load, daemon=True).start()
+
+    def _motion_loaded(self, version, motion, clips):
+        if version != self.catalog_version:
+            return
+        self.motion, self.weapon_clips = motion, clips
+        self.motion_scale.configure(to=max(0, motion.frame_count - 1))
+        self.motion_frame_var.set(0)
+        self.physics_reset = True
+        self._publish_pose()
+
+    def _pose_dragged(self):
+        if not self.motion_playing:
+            self.physics_reset = True
+            self._publish_pose()
+
+    def _publish_pose(self):
+        if self.motion is None or self.rig is None or not self.active or self.pose_pending:
+            return
+        frame = float(self.motion_frame_var.get())
+        try:
+            pose = photo_assets.sample_pose(self.motion, frame, self.rig["baseline"])
+            weapon_poses = [(rig, photo_assets.sample_pose(m, frame, rig["baseline"])) for rig, m in self.weapon_clips]
+        except (ValueError, photo_assets.FarcError) as exc:
+            self._stop_playback()
+            self.pose_status_var.set(str(exc))
+            return
+        rig, command = self.rig, 4 if self.physics_reset else 2
+        self.physics_reset = False
+        self.pose_pending = True
+
+        def action(b):
+            try:
+                flag = b.read("body", 24, 4)
+                if not flag or struct.unpack("<i", flag)[0] != 0:
+                    return None
+                for slot in range(10):  # clear every weapon slot, then fill the clips that still match
+                    b.write("body", WEAPON_START + slot * WEAPON_STRIDE + 19552, bytes(12))
+                count = b.read("body", WEAPON_COUNT, 4)
+                weapon_count = struct.unpack("<i", count)[0] if count else 0
+                for weapon, values in weapon_poses:
+                    start = WEAPON_START + weapon["slot"] * WEAPON_STRIDE
+                    head = b.read("body", start, 28)
+                    if weapon["slot"] < weapon_count and head and struct.unpack_from("<QQQi", head) == (
+                            weapon["rig"], weapon["mesh"], weapon["pose"], len(weapon["bones"])):
+                        b.write("body", start + 14432, struct.pack(f"<{len(values)}f", *values))
+                        b.write("body", start + 19552, struct.pack("<Qi", weapon["rig"], len(weapon["bones"])))
+                b.write("body", 56, struct.pack("<Q", rig["generation"]))
+                b.write("body", 36, struct.pack("<i", len(rig["bones"])))
+                b.write("body", BODY_POSE, struct.pack(f"<{len(pose)}f", *pose))
+                b.write("body", 24, struct.pack("<i", command))
+            finally:
+                self.pose_pending = False
+            return None
+        self.worker.do(action)
+
+    def _restore_motion(self):
+        self._stop_playback()
+        self.motion = None
+        self.motion_var.set("")
+        self.worker.do(lambda b: (b.write("body", 24, struct.pack("<i", 3))
+                                  if (f := b.read("body", 24, 4)) and struct.unpack("<i", f)[0] == 0 else None, None)[1])
+
+    def _toggle_motion_play(self):
+        if self.motion_playing:
+            self._stop_playback()
+            return
+        if self.motion is None:
+            return
+        if self.motion_frame_var.get() >= float(self.motion_scale.cget("to")):
+            self.motion_frame_var.set(0)
+            self.physics_reset = True
+        self.motion_playing = True
+        self.motion_play.configure(text="Pause")
+        self.motion_clock = (time.monotonic(), self.motion_frame_var.get())
+        self._tick_motion()
+
+    def _tick_motion(self):
+        if not self.motion_playing:
+            return
+        start, first = self.motion_clock
+        end = float(self.motion_scale.cget("to"))
+        frame = min(end, first + (time.monotonic() - start) * 60)
+        self.motion_frame_var.set(frame)
+        self._publish_pose()
+        if frame >= end:
+            self._stop_playback()
+        else:
+            self.after(16, self._tick_motion)
+
+    def _stop_playback(self):
+        self.expression_playing = self.motion_playing = False
+        if hasattr(self, "expression_play"):
+            self.expression_play.configure(text="Play")
+        if hasattr(self, "motion_play"):
+            self.motion_play.configure(text="Play")
 
     def _close(self):
         self.after_cancel(self.poll_id)
+        self._stop_playback()
         if self.active:
-            self.bridge.send("cmd 4")
-        self.bridge.close()
+            self.worker.do(lambda b: (b.request("cmd 4"), None)[1])
+        self.worker.stop()
         self.destroy()
 
 
@@ -1818,28 +2432,60 @@ class ServerTab(ttk.Frame):
             ttk.Entry(self, textvariable=var, width=22, show=show).grid(row=row, column=1, sticky="w")
             row += 1
 
-        row += 1
         ttk.Label(self, textvariable=self.status_var, foreground="gray", wraplength=420).grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        row += 1
 
-        ttk.Separator(self, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
-        ttk.Label(self, text="Local server process (ALL.Net/billing/AimeDB) - separate from the game "
-                              "itself. fgo-launcher.sh starts it automatically before Play if configured "
-                              "to, but you can also control it here directly (e.g. to restart it after "
-                              "changing Draw Rates/Banners settings, without relaunching the game).",
-                  foreground="gray", wraplength=420).grid(row=row, column=0, columnspan=2, sticky="w")
-        row += 1
-        server_buttons = ttk.Frame(self)
-        server_buttons.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        # Right-hand column: the left one already fills the window's height.
+        side = ttk.Frame(self)
+        side.grid(row=0, column=2, rowspan=row + 1, sticky="nw", padx=(28, 0))
+        side_row = 0
+        env_text = read_env_file()
+        ttk.Label(side, text="ALL.Net accounting report", font=("TkDefaultFont", 10, "bold")).grid(
+            row=side_row, column=0, columnspan=2, sticky="w")
+        side_row += 1
+        ttk.Label(side, text="Booting shortly before its daily time can hang the startup screen at "
+                             "\"ALL.Net : WAIT (A, BUSY)\" - restart after that time to get past it.",
+                  foreground="gray", wraplength=320).grid(row=side_row, column=0, columnspan=2, sticky="w")
+        side_row += 1
+        self.billing_tls_var = tk.BooleanVar(value=get_env_value(env_text, "FGO_BILLING_TLS10") == "1")
+        ttk.Checkbutton(side, text="Allow TLS 1.0 on the billing port",
+                        variable=self.billing_tls_var).grid(row=side_row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        side_row += 1
+        ttk.Label(side, text="Lets the report through. Applies on the next server start.",
+                  foreground="gray", wraplength=320).grid(row=side_row, column=0, columnspan=2, sticky="w")
+        side_row += 1
+        report_time = get_env_value(env_text, "FGO_ACCOUNTING_REPORT_TIME")
+        self.report_time_var = tk.StringVar(
+            value=f"{report_time[:2]}:{report_time[2:]}" if len(report_time) == 4 else "")
+        ttk.Label(side, text="Daily report time (HH:MM)").grid(row=side_row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(side, textvariable=self.report_time_var, width=8).grid(
+            row=side_row, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        side_row += 1
+        ttk.Label(side, text="Blank = the game's default (07:00). Pick an hour you never play, e.g. 02:00. "
+                             "Applies on the next game launch.",
+                  foreground="gray", wraplength=320).grid(row=side_row, column=0, columnspan=2, sticky="w")
+        side_row += 1
+
+        ttk.Separator(side, orient="horizontal").grid(row=side_row, column=0, columnspan=2, sticky="ew", pady=10)
+        side_row += 1
+        ttk.Label(side, text="Local server process", font=("TkDefaultFont", 10, "bold")).grid(
+            row=side_row, column=0, columnspan=2, sticky="w")
+        side_row += 1
+        ttk.Label(side, text="ALL.Net/billing/AimeDB - separate from the game itself. fgo-launcher.sh starts "
+                             "it automatically before Play if configured to, but you can also control it "
+                             "here directly (e.g. to restart it after changing Draw Rates/Banners settings, "
+                             "without relaunching the game).",
+                  foreground="gray", wraplength=320).grid(row=side_row, column=0, columnspan=2, sticky="w")
+        side_row += 1
+        server_buttons = ttk.Frame(side)
+        server_buttons.grid(row=side_row, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Button(server_buttons, text="Start Server", command=self._start_server).pack(side="left")
         ttk.Button(server_buttons, text="Stop Server", command=self._stop_server).pack(side="left", padx=(6, 0))
         ttk.Button(server_buttons, text="Restart Server", command=self._restart_server).pack(side="left", padx=(6, 0))
-        row += 1
+        side_row += 1
         self.server_status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.server_status_var, foreground="gray", wraplength=420).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(side, textvariable=self.server_status_var, foreground="gray", wraplength=320).grid(
+            row=side_row, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     def _run_server_script(self, script_name, busy_text, timeout=60):
         script = Path(__file__).resolve().parent.parent / script_name
@@ -1881,6 +2527,17 @@ class ServerTab(ttk.Frame):
             run_server_tool("apply", "--host", host,
                              "--http", str(ports["http"]), "--billing", str(ports["billing"]),
                              "--aime", str(ports["aime"]), "--database", str(ports["database"]))
+
+        report_time = self.report_time_var.get().strip()
+        match = re.fullmatch(r"([01]?[0-9]|2[0-3]):?([0-5][0-9])", report_time)
+        if report_time and not match:
+            raise ValueError("Daily report time must be HH:MM (24-hour), e.g. 02:00, or blank.")
+        set_env_values({
+            "FGO_BILLING_TLS10": "1" if self.billing_tls_var.get() else "0",
+            # Blank = the stock 0700, written rather than left out so clearing the
+            # field undoes an earlier custom time.
+            "FGO_ACCOUNTING_REPORT_TIME": f"{int(match.group(1)):02d}{match.group(2)}" if match else "0700",
+        })
 
         db_host = self.db_host_var.get().strip()
         db_user = self.db_user_var.get().strip()
