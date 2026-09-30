@@ -21,6 +21,7 @@ placeholder until a valid install root is set.
 import json
 import os
 import queue
+import mmap
 import re
 import shlex
 import shutil
@@ -737,16 +738,73 @@ class CardTranslations:
     This data isn't ours to redistribute (scooby ships no LICENSE granting
     that), so it's never bundled in this repo - found dynamically instead,
     checked in order: FGO_SCOOBY_SRC in fgo.env (a scooby source checkout -
-    its src/FGOLocalPlatform.*.json), then linux/tools/data/ (for anyone who
-    drops a copy there themselves - gitignored, not tracked). Missing
+    its src/FGOLocalPlatform.*.json), then the user's own "FGOAC scooby.exe"
+    (install root or EN-patch folder - the same JSONs are embedded resources
+    in its bundled FGOLocalPlatform.dll), then linux/tools/data/ (for anyone
+    who drops a copy there themselves - gitignored, not tracked). Cloud23333's
+    FGOLocalPlatform.dll has them too, but only in Japanese/Chinese. Missing
     entirely just means untranslated (Japanese) names/no effect text - never
     a hard error."""
 
     FILENAMES = {"names": "FGOLocalPlatform.CardNames.json", "effects": "FGOLocalPlatform.CraftEffects.json"}
 
     def __init__(self):
-        self.names = self._load("names", "CardNames.json")
-        self.effects = self._load("effects", "CraftEffects.json")
+        # Loaded on demand (Deck tab's Names: English toggle) - the scooby.exe
+        # lookup maps a 140 MB file, so nothing is read until it's asked for.
+        self.names = {}
+        self.effects = {}
+        self.loaded = False
+        self.english = False
+
+    def ensure_loaded(self):
+        """Loads the data once; True if English names were found."""
+        if not self.loaded:
+            self.names = self._load("names", "CardNames.json")
+            self.effects = self._load("effects", "CraftEffects.json")
+            if not self.names or not self.effects:
+                embedded = self._from_scooby_exe()
+                self.names = self.names or embedded.get("names", {})
+                self.effects = self.effects or embedded.get("effects", {})
+            self.loaded = True
+        return bool(self.names)
+
+    def reset(self):
+        """Forget loaded data (the install root changed)."""
+        self.__init__()
+
+    @staticmethod
+    def _from_scooby_exe():
+        """Pulls the embedded CardNames/CraftEffects JSON out of scooby's
+        single-file exe. .NET stores a manifest resource as a 4-byte length
+        followed by the raw bytes, and the bundle keeps FGOLocalPlatform.dll
+        uncompressed, so each resource is a length-prefixed JSON object whose
+        first key is SVT00001 (names) or CE00001 (names or effects)."""
+        folders = [install_root_or_none(), os.environ.get("FGO_PACKAGE_ROOT", "").strip() or None]
+        for folder in folders:
+            exe = Path(folder) / "FGOAC scooby.exe" if folder else None
+            if exe is None or not exe.is_file():
+                continue
+            found = {}
+            try:
+                with open(exe, "rb") as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as blob:
+                    for match in re.finditer(rb'\{\r?\n\s*"(?:SVT|CE)00001"', blob):
+                        start = match.start()
+                        if start < 4:
+                            continue
+                        length = struct.unpack_from("<I", blob, start - 4)[0]
+                        if not 100 < length <= len(blob) - start:
+                            continue
+                        try:
+                            data = json.loads(blob[start:start + length].decode("utf-8-sig"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        first = next(iter(data.values()), {})
+                        found.setdefault("effects" if "Normal" in first else "names", data)
+            except (OSError, ValueError):
+                continue
+            if found:
+                return found
+        return {}
 
     def _candidates(self, scooby_filename, local_filename):
         scooby_src = os.environ.get("FGO_SCOOBY_SRC", "").strip()
@@ -771,6 +829,8 @@ class CardTranslations:
         return None
 
     def english_name(self, card):
+        if not self.english:
+            return None
         internal_id = self.internal_id(card)
         entry = self.names.get(internal_id) if internal_id else None
         return entry["Chinese"] if entry else None  # yes, "Chinese" key really holds the English name upstream
@@ -781,6 +841,8 @@ class CardTranslations:
         return entry["Japanese"] if entry else None
 
     def craft_essence_effect(self, card):
+        if not self.english:
+            return None
         internal_id = self.internal_id(card)
         if not internal_id or not internal_id.startswith("CE"):
             return None
@@ -3236,6 +3298,13 @@ class DeckTab(ttk.Frame):
                          command=self._on_view_mode_changed).pack(side="left")
         ttk.Radiobutton(toolbar, text="Icons", value="Icons", variable=self.view_mode, style="Toolbutton",
                          command=self._on_view_mode_changed).pack(side="left")
+        ttk.Label(toolbar, text="Names").pack(side="left", padx=(16, 4))
+        saved_names = get_env_value(read_env_file(), "FGO_GUI_CARD_NAMES")
+        self.names_mode = tk.StringVar(value="English" if saved_names == "english" else "Raw")
+        for label in ("Raw", "English"):
+            ttk.Radiobutton(toolbar, text=label, value=label, variable=self.names_mode, style="Toolbutton",
+                             command=self._on_names_mode_changed).pack(side="left")
+        self._apply_names_mode()
 
         self.summary_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.summary_var, foreground="gray", wraplength=780).pack(anchor="w", pady=(6, 4))
@@ -3453,6 +3522,33 @@ class DeckTab(ttk.Frame):
     def _on_view_mode_changed(self):
         self.page = 0
         self._render_current_page()
+
+    def _apply_names_mode(self):
+        """Switches TRANSLATIONS to the toggle's mode; returns an error text
+        when English was asked for but no name data could be found."""
+        english = self.names_mode.get() == "English"
+        if english and not TRANSLATIONS.ensure_loaded():
+            self.names_mode.set("Raw")
+            english = False
+            error = ("No English card names found - they come from \"FGOAC scooby.exe\" in the install "
+                     "root or EN-patch folder, or a scooby checkout (FGO_SCOOBY_SRC).")
+        else:
+            error = None
+        TRANSLATIONS.english = english
+        return error
+
+    def _on_names_mode_changed(self):
+        if self.names_mode.get() == "English" and not TRANSLATIONS.loaded:
+            self.summary_var.set("Loading English card names...")
+            self.update_idletasks()
+        error = self._apply_names_mode()
+        # A GUI preference, saved immediately; never creates fgo.env on its own.
+        if env_file_path().exists():
+            set_env_values({"FGO_GUI_CARD_NAMES": self.names_mode.get().lower()})
+        self._apply_filter()
+        self._refresh_selected_list()
+        if error:
+            self.summary_var.set(error)
 
     def _on_grid_canvas_resize(self, event):
         # The icon grid previously hardcoded 6 columns regardless of the
@@ -4343,6 +4439,11 @@ class App(tk.Tk):
         self.title(f"FGO Arcade settings - {root or '(no install configured)'}")
         self.geometry("980x760")
         self.minsize(760, 560)
+        # Tk's X11 entry bindings are Emacs-style (Ctrl+A = line start);
+        # make Ctrl+A select all like everywhere else on the desktop.
+        for widget_class in ("TEntry", "Entry", "TCombobox", "TSpinbox"):
+            for sequence in ("<Control-a>", "<Control-A>"):
+                self.bind_class(widget_class, sequence, self._select_all)
 
         self.notebook = ttk.Notebook(self)
 
@@ -4380,6 +4481,12 @@ class App(tk.Tk):
 
         self.notebook.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
+    @staticmethod
+    def _select_all(event):
+        event.widget.select_range(0, "end")
+        event.widget.icursor("end")
+        return "break"
+
     def _build_install_tabs(self):
         self.display_tab = DisplayTab(self.notebook)
         self.controls_tab = ControlsTab(self.notebook)
@@ -4401,6 +4508,7 @@ class App(tk.Tk):
         if root is None:
             return
         if self.display_tab is None:
+            TRANSLATIONS.reset()  # any lookup so far ran before this install root was known
             self.notebook.forget(self.placeholder)
             self.placeholder.destroy()
             self._build_install_tabs()
