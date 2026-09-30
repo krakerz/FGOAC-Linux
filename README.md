@@ -78,8 +78,8 @@ Only via the experimental 120 option; the hook's high-FPS mode is only partly co
 
 ## Credits
 
-- Cloud23333 - the FGO Arcade distribution this runs, including its compatibility hook (fgohook) and English-patch payload.
-- scooby (FGOAC scooby launcher) - the Windows launcher this GUI mirrors; reference for its features and data formats.
+- Cloud23333 - the FGO Arcade distribution this runs, including its compatibility hook (fgohook).
+- githubuser420x - FGOAC scooby, the Windows launcher this GUI mirrors (reference for its features and data formats), and the English patch.
 - segatools - upstream base of the arcade I/O hooks.
 
 ---
