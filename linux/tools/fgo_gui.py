@@ -1193,6 +1193,16 @@ class DisplayTab(ttk.Frame):
             key_names = key_names + [self.hide_ui_key_var.get()]
         ttk.Combobox(advanced, textvariable=self.hide_ui_key_var, values=key_names,
                      state="readonly", width=18).grid(row=row, column=1, sticky="w")
+        row += 1
+
+        ttk.Separator(advanced, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=8)
+        row += 1
+        shader_row = ttk.Frame(advanced)
+        shader_row.grid(row=row, column=0, columnspan=4, sticky="w")
+        ttk.Button(shader_row, text="Clear shader cache", command=self._clear_shader_cache).pack(side="left")
+        self.shader_cache_var = tk.StringVar()
+        ttk.Label(shader_row, textvariable=self.shader_cache_var, foreground="gray").pack(side="left", padx=(10, 0))
+        self._refresh_shader_cache_label()
 
         # App/audio-volume.ini - a separate file scooby's own
         # AudioSettingsView reads/writes, applied live by the running game
@@ -1230,6 +1240,51 @@ class DisplayTab(ttk.Frame):
     def _set_all_volume(self, value):
         for var in self.volume_vars.values():
             var.set(value)
+
+    @staticmethod
+    def _shader_cache_stats(path):
+        count = size = 0
+        if path is not None and path.is_dir():
+            for entry in path.rglob("*"):
+                if entry.is_file():
+                    count += 1
+                    size += entry.stat().st_size
+        return count, size
+
+    def _refresh_shader_cache_label(self):
+        try:
+            count, size = self._shader_cache_stats(App._find_shader_cache_dir())
+        except OSError:
+            count, size = 0, 0
+        self.shader_cache_var.set(f"{count} shaders cached ({size / 1048576:.0f} MB). "
+                                  "The next launch recompiles what it needs.")
+
+    def _clear_shader_cache(self):
+        if subprocess.run(["pgrep", "-x", "ago.exe"], capture_output=True).returncode == 0:
+            messagebox.showwarning("Game is running", "Close the game before clearing its shader cache.")
+            return
+        cache_dir = App._find_shader_cache_dir()
+        count, size = self._shader_cache_stats(cache_dir)
+        if count == 0:
+            self._refresh_shader_cache_label()
+            return
+        # App/shader-cache-rN is a symlink into the persistent store
+        # (fgo-launcher.sh); empty the real folder, keep it and the link.
+        real_dir = cache_dir.resolve()
+        if not messagebox.askyesno("Clear shader cache",
+                                   f"Delete {count} cached shaders ({size / 1048576:.0f} MB) from {real_dir}?\n\n"
+                                   "The first launch afterwards compiles them again (slower loading, "
+                                   "some stutter the first time each scene appears)."):
+            return
+        try:
+            for entry in real_dir.iterdir():
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+        except OSError as exc:
+            messagebox.showerror("Clear shader cache", f"Could not clear everything: {exc}")
+        self._refresh_shader_cache_label()
 
     def _build_photo_tab(self, frame):
         photo = self.graphics_data.get("photo") if isinstance(self.graphics_data.get("photo"), dict) else {}
@@ -2443,15 +2498,17 @@ class ServerTab(ttk.Frame):
         ttk.Label(side, text="ALL.Net accounting report", font=("TkDefaultFont", 10, "bold")).grid(
             row=side_row, column=0, columnspan=2, sticky="w")
         side_row += 1
-        ttk.Label(side, text="Booting shortly before its daily time can hang the startup screen at "
-                             "\"ALL.Net : WAIT (A, BUSY)\" - restart after that time to get past it.",
+        ttk.Label(side, text="The game sends a daily billing report. Starting it within about an hour before "
+                             "that time hangs the startup screen at \"ALL.Net : WAIT (A, BUSY)\" until you "
+                             "restart after the report time.",
                   foreground="gray", wraplength=320).grid(row=side_row, column=0, columnspan=2, sticky="w")
         side_row += 1
         self.billing_tls_var = tk.BooleanVar(value=get_env_value(env_text, "FGO_BILLING_TLS10") == "1")
         ttk.Checkbutton(side, text="Allow TLS 1.0 on the billing port",
                         variable=self.billing_tls_var).grid(row=side_row, column=0, columnspan=2, sticky="w", pady=(8, 0))
         side_row += 1
-        ttk.Label(side, text="Lets the report through. Applies on the next server start.",
+        ttk.Label(side, text="Lets the report reach the local server (it can't otherwise). Doesn't prevent the "
+                             "hang above. Applies on the next server start.",
                   foreground="gray", wraplength=320).grid(row=side_row, column=0, columnspan=2, sticky="w")
         side_row += 1
         report_time = get_env_value(env_text, "FGO_ACCOUNTING_REPORT_TIME")
@@ -2461,8 +2518,9 @@ class ServerTab(ttk.Frame):
         ttk.Entry(side, textvariable=self.report_time_var, width=8).grid(
             row=side_row, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
         side_row += 1
-        ttk.Label(side, text="Blank = the game's default (07:00). Pick an hour you never play, e.g. 02:00. "
-                             "Applies on the next game launch.",
+        ttk.Label(side, text="The game can't boot during the ~1 hour before this time, so pick a time you're "
+                             "unlikely to play, e.g. 02:00 (no booting 01:00-02:00). Blank = the game's "
+                             "default, 07:00 (no booting 06:00-07:00). Applies on the next game launch.",
                   foreground="gray", wraplength=320).grid(row=side_row, column=0, columnspan=2, sticky="w")
         side_row += 1
 
